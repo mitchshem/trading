@@ -3,6 +3,10 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createChart, IChartApi, ISeriesApi } from 'lightweight-charts'
 
+// Frontend ↔ Backend Communication
+// Frontend calls backend REST API endpoints and WebSocket for real-time updates
+// Backend runs on http://localhost:8000 (configured in backend/main.py)
+// CORS is configured to allow requests from http://localhost:3000 (frontend)
 const API_BASE = 'http://localhost:8000'
 const WS_URL = 'ws://localhost:8000/ws'
 

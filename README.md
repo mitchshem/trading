@@ -26,33 +26,15 @@ A scoped MVP for a paper-trading system that mirrors a small subset of TradingVi
 └── README.md                  # This file
 ```
 
-## Quick Start
+## Run Locally
 
 ### Prerequisites
 - Python 3.8+ with pip
 - Node.js 18+ with npm
 
-### Running the Application
+### Step 1: Start Backend
 
-#### Option 1: Single Command Script (Easiest)
-
-From the project root:
-```bash
-chmod +x run.sh
-./run.sh
-```
-
-This will:
-- Set up Python virtual environment (if needed)
-- Install backend dependencies
-- Install frontend dependencies
-- Start both backend and frontend services
-
-Press `Ctrl+C` to stop both services.
-
-#### Option 2: Run Separately (Recommended for Development)
-
-**Terminal 1 - Backend:**
+Open Terminal 1:
 ```bash
 cd backend
 python3 -m venv venv
@@ -61,29 +43,58 @@ pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-**Terminal 2 - Frontend:**
+You should see:
+```
+============================================================
+BACKEND STARTED
+============================================================
+Backend URL: http://localhost:8000
+API Docs: http://localhost:8000/docs
+...
+```
+
+### Step 2: Start Frontend
+
+Open Terminal 2:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-#### Option 3: Using concurrently
-
-```bash
-# Install concurrently globally (if not already installed)
-npm install -g concurrently
-
-# From project root
-cd backend && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt && cd ..
-concurrently "cd backend && source venv/bin/activate && uvicorn main:app --reload --port 8000" "cd frontend && npm run dev"
+You should see:
+```
+- ready started server on 0.0.0.0:3000
 ```
 
-### Access the Application
+### Step 3: Open Browser
 
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000
-- API Docs: http://localhost:8000/docs
+Open http://localhost:3000 in your browser.
+
+You should see:
+- Symbol dropdown (select a symbol like AAPL)
+- Candlestick chart with historical data
+- Account panel (equity, daily P&L, open positions)
+- Trades table
+- Performance metrics
+- Replay panel (for historical backtesting)
+- Trading signals table
+
+### Alternative: Single Command Script
+
+From project root:
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+This starts both backend and frontend. Press `Ctrl+C` to stop.
+
+### Access Points
+
+- **Frontend (Main App)**: http://localhost:3000
+- **Backend API**: http://localhost:8000
+- **API Documentation**: http://localhost:8000/docs
 
 ## Features Implemented
 
