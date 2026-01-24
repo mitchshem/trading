@@ -1250,6 +1250,43 @@ export default function Home() {
                 </div>
               )}
             </div>
+            
+            {/* Determinism Status */}
+            {replayStatus.determinism_status && (
+              <div style={{ 
+                marginTop: '12px', 
+                padding: '8px', 
+                backgroundColor: replayStatus.determinism_status === 'verified' ? '#1a3a1a' : replayStatus.determinism_status === 'mismatch' ? '#3a1a1a' : '#2a2a2a',
+                borderRadius: '4px',
+                border: `1px solid ${replayStatus.determinism_status === 'verified' ? '#26a69a' : replayStatus.determinism_status === 'mismatch' ? '#ef5350' : '#3a3a3a'}`,
+                fontSize: '13px'
+              }}>
+                <div style={{ 
+                  color: replayStatus.determinism_status === 'verified' ? '#26a69a' : replayStatus.determinism_status === 'mismatch' ? '#ef5350' : '#9ca3af',
+                  fontWeight: '600',
+                  marginBottom: '4px'
+                }}>
+                  {replayStatus.determinism_status === 'verified' ? '✓ Deterministic replay confirmed' : 
+                   replayStatus.determinism_status === 'mismatch' ? '✗ Mismatch detected (see logs)' : 
+                   '○ No previous run to compare'}
+                </div>
+                {replayStatus.determinism_message && (
+                  <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>
+                    {replayStatus.determinism_message}
+                  </div>
+                )}
+                {replayStatus.determinism_mismatches && (
+                  <div style={{ color: '#ef5350', fontSize: '12px', marginTop: '4px' }}>
+                    Mismatches: {replayStatus.determinism_mismatches.join(', ')}
+                  </div>
+                )}
+                {replayStatus.replay_fingerprint && (
+                  <div style={{ color: '#6b7280', fontSize: '11px', marginTop: '4px', fontFamily: 'monospace' }}>
+                    Fingerprint: {replayStatus.replay_fingerprint}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
         
