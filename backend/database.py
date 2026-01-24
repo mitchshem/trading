@@ -114,6 +114,44 @@ class EquityCurve(Base):
         }
 
 
+class ReplaySummary(Base):
+    """
+    Replay summary model for storing completed replay results.
+    Used for evaluation, determinism verification, and historical tracking.
+    """
+    __tablename__ = "replay_summaries"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    replay_id = Column(String, unique=True, index=True, nullable=False)  # UUID
+    symbol = Column(String, index=True, nullable=False)
+    start_date = Column(String, nullable=True)  # YYYY-MM-DD format
+    end_date = Column(String, nullable=True)  # YYYY-MM-DD format
+    source = Column(String, nullable=True)  # e.g., "yahoo_finance", "manual"
+    candle_count = Column(Integer, nullable=False)
+    trade_count = Column(Integer, nullable=False)
+    final_equity = Column(Float, nullable=False)
+    max_drawdown_pct = Column(Float, nullable=False)
+    max_drawdown_absolute = Column(Float, nullable=False)
+    # FIX 1: CANONICAL TIME HANDLING - UTC timezone-aware datetime only
+    timestamp_completed = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "replay_id": self.replay_id,
+            "symbol": self.symbol,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "source": self.source,
+            "candle_count": self.candle_count,
+            "trade_count": self.trade_count,
+            "final_equity": self.final_equity,
+            "max_drawdown_pct": self.max_drawdown_pct,
+            "max_drawdown_absolute": self.max_drawdown_absolute,
+            "timestamp_completed": self.timestamp_completed.isoformat() if self.timestamp_completed else None
+        }
+
+
 # Create tables
 def init_db():
     """Initialize database tables."""

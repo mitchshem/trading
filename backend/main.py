@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database import init_db, get_db, Signal, Trade, EquityCurve
+from database import init_db, get_db, Signal, Trade, EquityCurve, ReplaySummary
 from indicators import ema, atr
 from strategy import ema_trend_v1, PositionState
 from paper_broker import PaperBroker
@@ -777,9 +777,38 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
     else:
         return {"error": "Must provide either 'candles' array or both 'start_date' and 'end_date'"}, 400
     
-    # Safeguard: Validate candles
-    if not candles or len(candles) < 50:
-        return {"error": "Need at least 50 candles for replay (EMA(50) requires 50 candles)"}, 400
+    # GUARDRAILS: Validate candles meet minimum thresholds
+    MIN_CANDLES_FOR_REPLAY = 500  # Minimum for meaningful evaluation
+    MIN_CANDLES_FOR_INDICATORS = 50  # Minimum for EMA(50)
+    
+    if not candles:
+        return {"error": "No candles provided"}, 400
+    
+    if len(candles) < MIN_CANDLES_FOR_INDICATORS:
+        return {"error": f"Need at least {MIN_CANDLES_FOR_INDICATORS} candles for replay (EMA(50) requires {MIN_CANDLES_FOR_INDICATORS} candles)"}, 400
+    
+    if len(candles) < MIN_CANDLES_FOR_REPLAY:
+        return {
+            "error": f"Insufficient candles for meaningful evaluation. Got {len(candles)}, minimum {MIN_CANDLES_FOR_REPLAY} required.",
+            "warning": f"Replay with fewer than {MIN_CANDLES_FOR_REPLAY} candles may not provide reliable performance metrics"
+        }, 400
+    
+    # GUARDRAILS: Validate date range if provided
+    if request.start_date and request.end_date:
+        try:
+            start_dt = datetime.strptime(request.start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(request.end_date, "%Y-%m-%d")
+            date_range_days = (end_dt - start_dt).days
+            
+            MIN_DATE_RANGE_DAYS = 7  # Minimum 1 week for meaningful evaluation
+            
+            if date_range_days < MIN_DATE_RANGE_DAYS:
+                return {
+                    "error": f"Date range too short for meaningful evaluation. Got {date_range_days} days, minimum {MIN_DATE_RANGE_DAYS} days required.",
+                    "warning": f"Replay with date range shorter than {MIN_DATE_RANGE_DAYS} days may not provide reliable performance metrics"
+                }, 400
+        except ValueError:
+            pass  # Date validation already done above
     
     try:
         replay_id = replay_engine.start_replay(
@@ -791,26 +820,109 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
         
         replay_running = True
         
-        # Run replay synchronously (in production, consider background task)
-        # Processes candles ONE AT A TIME through full pipeline
-        result = replay_engine.run(db)
+        # MULTI-RUN SAFETY: Ensure replay state is always cleaned up, even on failure
+        try:
+            # Run replay synchronously (in production, consider background task)
+            # Processes candles ONE AT A TIME through full pipeline
+            result = replay_engine.run(db)
+            
+            # Fetch trades and equity curve for metrics computation
+            trades = db.query(Trade).filter(
+                Trade.replay_id == replay_id
+            ).order_by(Trade.entry_time).all()
+            
+            equity_curve = db.query(EquityCurve).filter(
+                EquityCurve.replay_id == replay_id
+            ).order_by(EquityCurve.timestamp).all()
+            
+            # Compute metrics for determinism verification and summary
+            metrics_snapshot = compute_metrics(trades, equity_curve)
+            
+            # DETERMINISM VERIFICATION: Check if same inputs produce same outputs
+            # Look for previous replays with same symbol and date range
+            if request.start_date and request.end_date:
+                previous_replays = db.query(ReplaySummary).filter(
+                    ReplaySummary.symbol == request.symbol,
+                    ReplaySummary.start_date == request.start_date,
+                    ReplaySummary.end_date == request.end_date,
+                    ReplaySummary.replay_id != replay_id  # Exclude current replay
+                ).order_by(ReplaySummary.timestamp_completed.desc()).limit(1).all()
+                
+                if previous_replays:
+                    prev = previous_replays[0]
+                    # Verify determinism: same inputs should produce same outputs
+                    mismatches = []
+                    
+                    if prev.candle_count != result["total_candles"]:
+                        mismatches.append(f"candle_count: {prev.candle_count} vs {result['total_candles']}")
+                    if prev.trade_count != len(trades):
+                        mismatches.append(f"trade_count: {prev.trade_count} vs {len(trades)}")
+                    if abs(prev.final_equity - result["final_equity"]) > 0.01:  # Allow small floating point differences
+                        mismatches.append(f"final_equity: {prev.final_equity:.2f} vs {result['final_equity']:.2f}")
+                    if abs(prev.max_drawdown_pct - metrics_snapshot.risk_metrics.max_drawdown_pct) > 0.01:
+                        mismatches.append(f"max_drawdown_pct: {prev.max_drawdown_pct:.2f}% vs {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+                    
+                    if mismatches:
+                        error_msg = f"DETERMINISM VIOLATION: Replay {replay_id} produced different results than previous replay {prev.replay_id} for same inputs ({request.symbol}, {request.start_date} to {request.end_date}). Mismatches: {', '.join(mismatches)}"
+                        print(f"[ERROR] {error_msg}")
+                        # Don't fail the replay, but log the violation clearly
+                        # In production, you might want to raise an exception here
+                    else:
+                        print(f"[DETERMINISM VERIFIED] Replay {replay_id} matches previous replay {prev.replay_id} for same inputs")
+            
+            # Log determinism metrics
+            print(f"[DETERMINISM] Replay {replay_id} completed:")
+            print(f"  Symbol: {request.symbol}")
+            print(f"  Date range: {request.start_date} to {request.end_date}")
+            print(f"  Candle count: {result['total_candles']}")
+            print(f"  Trade count: {len(trades)}")
+            print(f"  Final equity: {result['final_equity']:.2f}")
+            print(f"  Max drawdown: {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+            
+            # PERSIST REPLAY SUMMARY
+            replay_summary = ReplaySummary(
+                replay_id=replay_id,
+                symbol=request.symbol,
+                start_date=request.start_date,
+                end_date=request.end_date,
+                source=source,
+                candle_count=result["total_candles"],
+                trade_count=len(trades),
+                final_equity=result["final_equity"],
+                max_drawdown_pct=metrics_snapshot.risk_metrics.max_drawdown_pct,
+                max_drawdown_absolute=metrics_snapshot.risk_metrics.max_drawdown_absolute,
+                timestamp_completed=datetime.now(timezone.utc)
+            )
+            db.add(replay_summary)
+            db.commit()
+            
+            replay_running = False
+            
+            return {
+                "status": "completed",
+                "replay_id": replay_id,
+                "symbol": request.symbol,
+                "total_candles": result["total_candles"],
+                "final_equity": result["final_equity"],
+                "trade_count": len(trades),
+                "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
+                "source": source
+            }
         
-        replay_running = False
-        
-        return {
-            "status": "completed",
-            "replay_id": replay_id,
-            "symbol": request.symbol,
-            "total_candles": result["total_candles"],
-            "final_equity": result["final_equity"],
-            "source": source
-        }
+        except Exception as e:
+            # MULTI-RUN SAFETY: Always reset replay_running flag on failure
+            replay_running = False
+            # MULTI-RUN SAFETY: Reset replay engine state to prevent corruption
+            replay_engine.reset()
+            raise
     
     except ValueError as e:
         replay_running = False
+        replay_engine.reset()  # MULTI-RUN SAFETY: Clean up state
         return {"error": str(e)}, 400
     except Exception as e:
         replay_running = False
+        replay_engine.reset()  # MULTI-RUN SAFETY: Clean up state
         return {"error": f"Replay failed: {str(e)}"}, 500
 
 
@@ -858,6 +970,30 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
             for point in equity_curve
         ],
         "metrics": metrics_snapshot.to_dict()
+    }
+
+
+@app.get("/replay/history")
+async def get_replay_history(limit: int = 100, db: Session = Depends(get_db)):
+    """
+    Get history of completed replays for evaluation.
+    
+    Returns list of replay summaries sorted by completion time (newest first).
+    Used for:
+    - Tracking replay runs
+    - Determinism verification (comparing same inputs across runs)
+    - Performance evaluation over time
+    
+    Args:
+        limit: Maximum number of summaries to return (default: 100)
+    """
+    summaries = db.query(ReplaySummary).order_by(
+        ReplaySummary.timestamp_completed.desc()
+    ).limit(limit).all()
+    
+    return {
+        "replay_summaries": [s.to_dict() for s in summaries],
+        "count": len(summaries)
     }
 
 
