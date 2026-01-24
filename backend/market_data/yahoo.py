@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 import yfinance as yf
 import pandas as pd
-from backend.utils import ensure_utc_datetime
+from utils import ensure_utc_datetime
 
 
 def fetch_yahoo_candles(
