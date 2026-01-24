@@ -118,24 +118,58 @@ export default function Home() {
   const equitySeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   
   // Replay state
-  const [replaySymbol, setReplaySymbol] = useState<string>('')
+  const [replaySymbol, setReplaySymbol] = useState<string>('AAPL') // Default symbol
   const [replayStartDate, setReplayStartDate] = useState<string>('')
   const [replayEndDate, setReplayEndDate] = useState<string>('')
   const [replayStatus, setReplayStatus] = useState<any>(null)
   const [replayResults, setReplayResults] = useState<any>(null)
   const [isReplayRunning, setIsReplayRunning] = useState(false)
+  const [backendError, setBackendError] = useState<string | null>(null)
 
-  // Fetch symbols on mount
+  // Calculate default date range (last 6 months)
+  const getDefaultDateRange = () => {
+    const endDate = new Date()
+    const startDate = new Date()
+    startDate.setMonth(startDate.getMonth() - 6)
+    
+    return {
+      start: startDate.toISOString().split('T')[0],
+      end: endDate.toISOString().split('T')[0]
+    }
+  }
+
+  // Fetch symbols on mount and set defaults
   useEffect(() => {
     fetch(`${API_BASE}/symbols`)
-      .then(res => res.json())
+      .then(res => {
+        if (!res.ok) {
+          throw new Error('Backend not responding')
+        }
+        return res.json()
+      })
       .then(data => {
+        setBackendError(null)
         setSymbols(data.symbols || [])
         if (data.symbols && data.symbols.length > 0) {
           setSelectedSymbol(data.symbols[0])
+          // Set default replay symbol if not already set
+          if (!replaySymbol || !data.symbols.includes(replaySymbol)) {
+            setReplaySymbol(data.symbols[0])
+          }
         }
+        // Set default date range
+        const defaultDates = getDefaultDateRange()
+        setReplayStartDate(defaultDates.start)
+        setReplayEndDate(defaultDates.end)
       })
-      .catch(err => console.error('Failed to fetch symbols:', err))
+      .catch(err => {
+        console.error('Failed to fetch symbols:', err)
+        setBackendError('Backend not connected. Please ensure backend is running on http://localhost:8000')
+        // Still set default dates even if backend fails
+        const defaultDates = getDefaultDateRange()
+        setReplayStartDate(defaultDates.start)
+        setReplayEndDate(defaultDates.end)
+      })
   }, [])
 
   // Initialize chart
@@ -967,6 +1001,32 @@ export default function Home() {
           Historical Replay (Backtest)
         </h2>
         
+        {backendError && (
+          <div style={{
+            padding: '12px',
+            backgroundColor: '#ef5350',
+            color: '#ffffff',
+            borderRadius: '4px',
+            marginBottom: '16px',
+            fontSize: '14px'
+          }}>
+            ⚠️ {backendError}
+          </div>
+        )}
+        
+        <div style={{ 
+          padding: '12px', 
+          backgroundColor: '#1a1a1a', 
+          borderRadius: '4px',
+          marginBottom: '16px',
+          fontSize: '13px',
+          color: '#9ca3af'
+        }}>
+          <div style={{ marginBottom: '8px', fontWeight: '600', color: '#d1d5db' }}>Defaults:</div>
+          <div>Symbol: <span style={{ color: '#26a69a' }}>{replaySymbol || 'Not set'}</span></div>
+          <div>Date Range: <span style={{ color: '#26a69a' }}>{replayStartDate || 'Not set'}</span> → <span style={{ color: '#26a69a' }}>{replayEndDate || 'Not set'}</span></div>
+        </div>
+        
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center', marginBottom: '16px' }}>
           <label htmlFor="replay-symbol-select" style={{ fontSize: '14px', fontWeight: '500' }}>
             Symbol:
@@ -1047,8 +1107,9 @@ export default function Home() {
               }
               
               setIsReplayRunning(true)
-              setReplayStatus(null)
+              setReplayStatus({ status: 'Running...' })
               setReplayResults(null)
+              setBackendError(null)
               
               try {
                 // Start replay with date range (will fetch from Yahoo Finance automatically)
@@ -1062,51 +1123,88 @@ export default function Home() {
                   })
                 })
                 
+                if (!replayRes.ok) {
+                  const errorData = await replayRes.json().catch(() => ({ error: 'Backend error' }))
+                  throw new Error(errorData.error || 'Replay failed')
+                }
+                
                 const replayData = await replayRes.json()
                 
                 if (replayData.error) {
-                  alert(`Replay failed: ${replayData.error}`)
-                  setIsReplayRunning(false)
-                  return
+                  throw new Error(replayData.error)
                 }
                 
                 // Fetch results
                 const resultsRes = await fetch(`${API_BASE}/replay/results?replay_id=${replayData.replay_id}`)
+                if (!resultsRes.ok) {
+                  throw new Error('Failed to fetch replay results')
+                }
                 const resultsData = await resultsRes.json()
                 
                 setReplayResults(resultsData)
                 setReplayStatus({
-                  status: 'completed',
+                  status: 'Completed',
                   replay_id: replayData.replay_id,
                   total_candles: replayData.total_candles,
                   final_equity: replayData.final_equity,
                   source: replayData.source || 'yahoo_finance'
                 })
                 
-                // FIX 2: EXPLICIT REPLAY ISOLATION
-                // Do NOT overwrite live metrics/equity with replay results.
-                // Replay results are displayed separately in replay panel only.
-                // Live metrics continue to be fetched via polling (see useEffect hooks above).
+                // Populate UI with replay results
+                // 1. Update trades with replay trades
+                if (resultsData.trades && resultsData.trades.length > 0) {
+                  setTrades(resultsData.trades)
+                }
+                
+                // 2. Update equity curve
+                if (resultsData.equity_curve && resultsData.equity_curve.length > 0) {
+                  setEquityCurve(resultsData.equity_curve)
+                }
+                
+                // 3. Update metrics
+                if (resultsData.metrics) {
+                  setMetrics(resultsData.metrics)
+                }
+                
+                // 4. Fetch signals for the replay symbol (replay signals are stored with replay_id)
+                fetch(`${API_BASE}/signals?symbol=${replaySymbol}&limit=100`)
+                  .then(res => res.json())
+                  .then(data => {
+                    if (data.signals) {
+                      // Filter to only show signals from this replay if possible
+                      setSignals(data.signals)
+                      // Update markers on chart
+                      if (updateMarkersRef.current) {
+                        updateMarkersRef.current(data.signals)
+                      }
+                    }
+                  })
+                  .catch(err => console.error('Failed to fetch signals:', err))
+                
+                // 5. Update selected symbol to trigger chart refresh
+                setSelectedSymbol(replaySymbol)
                 
               } catch (error: any) {
-                alert(`Replay error: ${error.message}`)
+                setBackendError(error.message || 'Replay failed')
+                setReplayStatus({ status: 'Error', error: error.message })
+                alert(`Replay failed: ${error.message}`)
               } finally {
                 setIsReplayRunning(false)
               }
             }}
-            disabled={isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate}
+            disabled={isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate || !!backendError}
             style={{
               padding: '8px 16px',
               fontSize: '14px',
               fontWeight: '600',
-              backgroundColor: isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate ? '#3a3a3a' : '#26a69a',
+              backgroundColor: isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate || !!backendError ? '#3a3a3a' : '#26a69a',
               color: '#ffffff',
               border: 'none',
               borderRadius: '4px',
-              cursor: isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate ? 'not-allowed' : 'pointer',
+              cursor: isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate || !!backendError ? 'not-allowed' : 'pointer',
             }}
           >
-            {isReplayRunning ? 'Running...' : 'Start Replay'}
+            {isReplayRunning ? 'Running...' : 'Run Replay'}
           </button>
         </div>
         
@@ -1120,18 +1218,33 @@ export default function Home() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '12px', fontSize: '14px' }}>
               <div>
                 <div style={{ color: '#9ca3af', marginBottom: '4px' }}>Status</div>
-                <div style={{ color: '#26a69a', fontWeight: '600' }}>{replayStatus.status}</div>
-              </div>
-              <div>
-                <div style={{ color: '#9ca3af', marginBottom: '4px' }}>Candles Processed</div>
-                <div style={{ color: '#ffffff', fontWeight: '600' }}>{replayStatus.total_candles}</div>
-              </div>
-              <div>
-                <div style={{ color: '#9ca3af', marginBottom: '4px' }}>Final Equity</div>
-                <div style={{ color: '#ffffff', fontWeight: '600' }}>
-                  ${replayStatus.final_equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                <div style={{ 
+                  color: replayStatus.status === 'Completed' ? '#26a69a' : replayStatus.status === 'Error' ? '#ef5350' : '#ffa726',
+                  fontWeight: '600' 
+                }}>
+                  {replayStatus.status}
                 </div>
               </div>
+              {replayStatus.total_candles && (
+                <div>
+                  <div style={{ color: '#9ca3af', marginBottom: '4px' }}>Candles Processed</div>
+                  <div style={{ color: '#ffffff', fontWeight: '600' }}>{replayStatus.total_candles.toLocaleString()}</div>
+                </div>
+              )}
+              {replayStatus.final_equity && (
+                <div>
+                  <div style={{ color: '#9ca3af', marginBottom: '4px' }}>Final Equity</div>
+                  <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                    ${replayStatus.final_equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </div>
+                </div>
+              )}
+              {replayStatus.error && (
+                <div>
+                  <div style={{ color: '#9ca3af', marginBottom: '4px' }}>Error</div>
+                  <div style={{ color: '#ef5350', fontWeight: '600', fontSize: '12px' }}>{replayStatus.error}</div>
+                </div>
+              )}
             </div>
           </div>
         )}
