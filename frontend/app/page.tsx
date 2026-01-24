@@ -115,6 +115,8 @@ export default function Home() {
   
   // Replay state
   const [replaySymbol, setReplaySymbol] = useState<string>('')
+  const [replayStartDate, setReplayStartDate] = useState<string>('')
+  const [replayEndDate, setReplayEndDate] = useState<string>('')
   const [replayStatus, setReplayStatus] = useState<any>(null)
   const [replayResults, setReplayResults] = useState<any>(null)
   const [isReplayRunning, setIsReplayRunning] = useState(false)
@@ -266,6 +268,11 @@ export default function Home() {
   }, [])
 
   // Fetch account info
+  // FIX 3: STATE UPDATE CONSISTENCY
+  // Polling: Account state is polled every 5 seconds as primary source of truth.
+  // WebSocket: Also refreshes account on trade execution (see WebSocket handler below).
+  // Rationale: Account state changes on every candle close (equity updates), so polling
+  // ensures UI stays current even if WebSocket misses updates.
   useEffect(() => {
     const fetchAccount = () => {
       fetch(`${API_BASE}/account`)
@@ -281,6 +288,11 @@ export default function Home() {
   }, [])
 
   // Fetch trades
+  // FIX 3: STATE UPDATE CONSISTENCY
+  // Polling: Trades are polled every 5 seconds as primary source of truth.
+  // WebSocket: Also refreshes trades on trade execution (see WebSocket handler below).
+  // Rationale: Trades may be executed outside WebSocket flow (stop-loss, kill switch),
+  // so polling ensures all trades are captured.
   useEffect(() => {
     const fetchTrades = () => {
       fetch(`${API_BASE}/trades?limit=100`)
@@ -304,6 +316,12 @@ export default function Home() {
   }, [selectedSymbol])
 
   // Fetch metrics
+  // FIX 3: STATE UPDATE CONSISTENCY
+  // Polling: Metrics are polled every 10 seconds as primary source of truth.
+  // Rationale: Metrics are computed from persisted data and change less frequently
+  // than account/trades, so longer polling interval is sufficient.
+  // FIX 2: EXPLICIT REPLAY ISOLATION - This fetches live trading metrics only.
+  // Replay metrics are displayed separately in replay panel.
   useEffect(() => {
     const fetchMetrics = () => {
       fetch(`${API_BASE}/metrics`)
@@ -319,6 +337,12 @@ export default function Home() {
   }, [])
 
   // Fetch equity curve
+  // FIX 3: STATE UPDATE CONSISTENCY
+  // Polling: Equity curve is polled every 10 seconds as primary source of truth.
+  // Rationale: Equity updates on every candle close, but chart doesn't need
+  // real-time updates, so 10-second interval is sufficient.
+  // FIX 2: EXPLICIT REPLAY ISOLATION - This fetches live trading equity curve only.
+  // Replay equity curve is displayed separately in replay panel.
   useEffect(() => {
     const fetchEquityCurve = () => {
       fetch(`${API_BASE}/equity-curve?limit=1000`)
@@ -719,6 +743,7 @@ export default function Home() {
                   <tr key={trade.id} style={{ borderBottom: '1px solid #3a3a3a' }}>
                     <td style={{ padding: '8px', color: '#d1d5db', fontWeight: '600' }}>{trade.symbol}</td>
                     <td style={{ padding: '8px', color: '#d1d5db' }}>
+                      {/* FIX 1: CANONICAL TIME HANDLING - Backend sends UTC, convert to local for display */}
                       {new Date(trade.entry_time).toLocaleString()}
                     </td>
                     <td style={{ padding: '8px', textAlign: 'right', color: '#d1d5db' }}>
@@ -728,6 +753,7 @@ export default function Home() {
                       {trade.shares}
                     </td>
                     <td style={{ padding: '8px', color: trade.exit_time ? '#d1d5db' : '#6b7280' }}>
+                      {/* FIX 1: CANONICAL TIME HANDLING - Backend sends UTC, convert to local for display */}
                       {trade.exit_time ? new Date(trade.exit_time).toLocaleString() : 'Open'}
                     </td>
                     <td style={{ padding: '8px', textAlign: 'right', color: trade.exit_price ? '#d1d5db' : '#6b7280' }}>
@@ -1016,17 +1042,10 @@ export default function Home() {
                   final_equity: replayData.final_equity
                 })
                 
-                // Refresh metrics to show replay results
-                fetch(`${API_BASE}/replay/results?replay_id=${replayData.replay_id}`)
-                  .then(res => res.json())
-                  .then(data => {
-                    if (data.metrics) {
-                      setMetrics(data.metrics)
-                    }
-                    if (data.equity_curve) {
-                      setEquityCurve(data.equity_curve)
-                    }
-                  })
+                // FIX 2: EXPLICIT REPLAY ISOLATION
+                // Do NOT overwrite live metrics/equity with replay results.
+                // Replay results are displayed separately in replay panel only.
+                // Live metrics continue to be fetched via polling (see useEffect hooks above).
                 
               } catch (error: any) {
                 alert(`Replay error: ${error.message}`)
@@ -1149,6 +1168,7 @@ export default function Home() {
                 {signals.map((signal) => (
                   <tr key={signal.id} style={{ borderBottom: '1px solid #3a3a3a' }}>
                     <td style={{ padding: '8px', color: '#d1d5db' }}>
+                      {/* FIX 1: CANONICAL TIME HANDLING - Backend sends UTC, convert to local for display */}
                       {new Date(signal.timestamp).toLocaleString()}
                     </td>
                     <td style={{ padding: '8px' }}>

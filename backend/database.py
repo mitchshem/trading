@@ -22,17 +22,24 @@ Base = declarative_base()
 
 
 class Signal(Base):
-    """Signal model for storing trading signals."""
+    """
+    Signal model for storing trading signals.
+    
+    FIX 2: EXPLICIT REPLAY ISOLATION
+    - replay_id = None: Live trading signals
+    - replay_id = UUID: Replay signals (isolated from live trading)
+    """
     __tablename__ = "signals"
     
     id = Column(Integer, primary_key=True, index=True)
-    # AUDIT FIX: Use timezone-aware UTC datetime (datetime.utcnow is deprecated)
+    # FIX 1: CANONICAL TIME HANDLING - UTC timezone-aware datetime only
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     symbol = Column(String, index=True)
     signal = Column(String)  # "BUY", "EXIT", "HOLD"
     price = Column(Float)
     reason = Column(String)
-    replay_id = Column(String, nullable=True, index=True)  # None for live trading, UUID for replays
+    # FIX 2: EXPLICIT REPLAY ISOLATION - None for live trading, UUID for replays
+    replay_id = Column(String, nullable=True, index=True)
     
     def to_dict(self):
         return {
@@ -46,11 +53,18 @@ class Signal(Base):
 
 
 class Trade(Base):
-    """Trade model for storing executed trades."""
+    """
+    Trade model for storing executed trades.
+    
+    FIX 2: EXPLICIT REPLAY ISOLATION
+    - replay_id = None: Live trading trades
+    - replay_id = UUID: Replay trades (isolated from live trading)
+    """
     __tablename__ = "trades"
     
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String, index=True)
+    # FIX 1: CANONICAL TIME HANDLING - UTC timezone-aware datetime only
     entry_time = Column(DateTime, index=True)
     entry_price = Column(Float)
     exit_time = Column(DateTime, nullable=True)
@@ -58,7 +72,8 @@ class Trade(Base):
     shares = Column(Integer)
     pnl = Column(Float, nullable=True)  # Realized P&L (null if position still open)
     reason = Column(String, nullable=True)  # Exit reason
-    replay_id = Column(String, nullable=True, index=True)  # None for live trading, UUID for replays
+    # FIX 2: EXPLICIT REPLAY ISOLATION - None for live trading, UUID for replays
+    replay_id = Column(String, nullable=True, index=True)
     
     def to_dict(self):
         return {
@@ -75,14 +90,21 @@ class Trade(Base):
 
 
 class EquityCurve(Base):
-    """Equity curve model for tracking account equity over time."""
+    """
+    Equity curve model for tracking account equity over time.
+    
+    FIX 2: EXPLICIT REPLAY ISOLATION
+    - replay_id = None: Live trading equity curve
+    - replay_id = UUID: Replay equity curve (isolated from live trading)
+    """
     __tablename__ = "equity_curve"
     
     id = Column(Integer, primary_key=True, index=True)
-    # AUDIT FIX: Use timezone-aware UTC datetime (datetime.utcnow is deprecated)
+    # FIX 1: CANONICAL TIME HANDLING - UTC timezone-aware datetime only
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     equity = Column(Float)
-    replay_id = Column(String, nullable=True, index=True)  # None for live trading, UUID for replays
+    # FIX 2: EXPLICIT REPLAY ISOLATION - None for live trading, UUID for replays
+    replay_id = Column(String, nullable=True, index=True)
     
     def to_dict(self):
         return {

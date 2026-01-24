@@ -11,6 +11,7 @@ from database import Signal, Trade, EquityCurve
 from indicators import ema, atr
 from strategy import ema_trend_v1, PositionState
 from paper_broker import PaperBroker
+from utils import ensure_utc_datetime, unix_to_utc_datetime
 
 
 class ReplayEngine:
@@ -30,6 +31,7 @@ class ReplayEngine:
         self.total_candles = 0
         self.status = "idle"  # idle, running, completed, error
         self.error_message: Optional[str] = None
+        self.source: Optional[str] = None  # Data source (e.g., "yahoo_finance")
     
     def reset(self):
         """Reset all state for a new replay."""
@@ -40,12 +42,14 @@ class ReplayEngine:
         self.total_candles = 0
         self.status = "idle"
         self.error_message = None
+        self.source = None
     
     def start_replay(
         self,
         symbol: str,
         candles: List[Dict],
-        replay_id: Optional[str] = None
+        replay_id: Optional[str] = None,
+        source: Optional[str] = None
     ) -> str:
         """
         Start a new replay.
@@ -83,6 +87,11 @@ class ReplayEngine:
         self.candle_history = candles.copy()
         self.total_candles = len(candles)
         self.status = "running"
+        self.source = source or "unknown"  # Log data source
+        
+        # Log source for tracking
+        if source:
+            print(f"Replay {replay_id} started with source: {source}, symbol: {symbol}, candles: {len(candles)}")
         
         return replay_id
     
@@ -139,22 +148,33 @@ class ReplayEngine:
         # Store signal if not HOLD
         signal_stored = False
         if result["signal"] != "HOLD":
-            signal_time = datetime.fromtimestamp(candle["time"], tz=timezone.utc)
+            # FIX 1: CANONICAL TIME HANDLING
+            # Convert Unix timestamp (API boundary) to UTC datetime (internal representation)
+            signal_time = unix_to_utc_datetime(candle["time"])
+            ensure_utc_datetime(signal_time, f"replay signal timestamp for {self.symbol}")
+            
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Replay signals: replay_id must match this replay (not None, not other replay)
             existing_signal = db_session.query(Signal).filter(
                 Signal.symbol == self.symbol,
                 Signal.timestamp == signal_time,
                 Signal.signal == result["signal"],
-                Signal.replay_id == self.replay_id
+                Signal.replay_id == self.replay_id  # Only this replay's signals
             ).first()
             
             if not existing_signal:
+                # FIX 2: EXPLICIT REPLAY ISOLATION
+                # Replay signals: replay_id is UUID (not None)
+                # This ensures replay data never mixes with live trading data
+                if self.replay_id is None:
+                    raise ValueError("Replay ID must be set for replay signals")
                 signal = Signal(
                     timestamp=signal_time,
                     symbol=self.symbol,
                     signal=result["signal"],
                     price=candle["close"],
                     reason=result["reason"],
-                    replay_id=self.replay_id
+                    replay_id=self.replay_id  # UUID for replays, None for live trading
                 )
                 db_session.add(signal)
                 db_session.commit()
@@ -176,14 +196,19 @@ class ReplayEngine:
         # Update trade records for stop-loss exits
         for exit_trade in stop_loss_exits:
             stop_loss_symbols.add(exit_trade["symbol"])
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Replay trades: replay_id must match this replay
             open_trade = db_session.query(Trade).filter(
                 Trade.symbol == exit_trade["symbol"],
                 Trade.exit_time.is_(None),
-                Trade.replay_id == self.replay_id
+                Trade.replay_id == self.replay_id  # Only this replay's trades
             ).first()
             
             if open_trade:
-                open_trade.exit_time = datetime.fromtimestamp(exit_trade["timestamp"], tz=timezone.utc)
+                # FIX 1: CANONICAL TIME HANDLING
+                exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
+                ensure_utc_datetime(exit_time, f"replay stop-loss exit time for {exit_trade['symbol']}")
+                open_trade.exit_time = exit_time
                 open_trade.exit_price = exit_trade["exit_price"]
                 open_trade.pnl = exit_trade["pnl"]
                 open_trade.reason = exit_trade["reason"]
@@ -212,17 +237,25 @@ class ReplayEngine:
             )
             
             if trade_executed:
-                # Create trade record (entry only, exit will be added later)
+                # FIX 1: CANONICAL TIME HANDLING
+                entry_time = unix_to_utc_datetime(candle["time"])
+                ensure_utc_datetime(entry_time, f"replay BUY entry time for {self.symbol}")
+                
+                # FIX 2: EXPLICIT REPLAY ISOLATION
+                # Replay trades: replay_id is UUID (not None)
+                # This ensures replay data never mixes with live trading data
+                if self.replay_id is None:
+                    raise ValueError("Replay ID must be set for replay trades")
                 trade = Trade(
                     symbol=self.symbol,
-                    entry_time=datetime.fromtimestamp(candle["time"], tz=timezone.utc),
+                    entry_time=entry_time,
                     entry_price=trade_executed["entry_price"],
                     shares=trade_executed["shares"],
                     exit_time=None,
                     exit_price=None,
                     pnl=None,
                     reason=None,
-                    replay_id=self.replay_id
+                    replay_id=self.replay_id  # UUID for replays, None for live trading
                 )
                 db_session.add(trade)
                 db_session.commit()
@@ -250,7 +283,10 @@ class ReplayEngine:
                 ).first()
                 
                 if open_trade:
-                    open_trade.exit_time = datetime.fromtimestamp(candle["time"], tz=timezone.utc)
+                    # FIX 1: CANONICAL TIME HANDLING
+                    exit_time = unix_to_utc_datetime(candle["time"])
+                    ensure_utc_datetime(exit_time, f"replay EXIT time for {self.symbol}")
+                    open_trade.exit_time = exit_time
                     open_trade.exit_price = trade_executed["exit_price"]
                     open_trade.pnl = trade_executed["pnl"]
                     open_trade.reason = trade_executed["reason"]
@@ -269,14 +305,19 @@ class ReplayEngine:
         
         # Update trade records for kill switch exits
         for exit_trade in kill_switch_exits:
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Replay trades: replay_id must match this replay
             open_trade = db_session.query(Trade).filter(
                 Trade.symbol == exit_trade["symbol"],
                 Trade.exit_time.is_(None),
-                Trade.replay_id == self.replay_id
+                Trade.replay_id == self.replay_id  # Only this replay's trades
             ).first()
             
             if open_trade:
-                open_trade.exit_time = datetime.fromtimestamp(exit_trade["timestamp"], tz=timezone.utc)
+                # FIX 1: CANONICAL TIME HANDLING
+                exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
+                ensure_utc_datetime(exit_time, f"replay kill switch exit time for {exit_trade['symbol']}")
+                open_trade.exit_time = exit_time
                 open_trade.exit_price = exit_trade["exit_price"]
                 open_trade.pnl = exit_trade["pnl"]
                 open_trade.reason = exit_trade["reason"]
@@ -292,10 +333,19 @@ class ReplayEngine:
             kill_switch_triggered = True
         
         # Update equity curve
+        # FIX 1: CANONICAL TIME HANDLING
+        equity_timestamp = unix_to_utc_datetime(candle["time"])
+        ensure_utc_datetime(equity_timestamp, f"replay equity curve timestamp for {self.symbol}")
+        
+        # FIX 2: EXPLICIT REPLAY ISOLATION
+        # Replay equity curve: replay_id is UUID (not None)
+        # This ensures replay data never mixes with live trading data
+        if self.replay_id is None:
+            raise ValueError("Replay ID must be set for replay equity curve")
         equity_point = EquityCurve(
-            timestamp=datetime.fromtimestamp(candle["time"], tz=timezone.utc),
+            timestamp=equity_timestamp,
             equity=self.broker.equity,
-            replay_id=self.replay_id
+            replay_id=self.replay_id  # UUID for replays, None for live trading
         )
         db_session.add(equity_point)
         db_session.commit()

@@ -14,6 +14,8 @@ from strategy import ema_trend_v1, PositionState
 from paper_broker import PaperBroker
 from metrics import compute_metrics
 from replay_engine import ReplayEngine
+from market_data.yahoo import fetch_yahoo_candles, convert_to_replay_format
+from utils import ensure_utc_datetime, unix_to_utc_datetime
 
 app = FastAPI(title="Paper Trading API")
 
@@ -221,6 +223,10 @@ async def get_signals(symbol: str, limit: int = 100, db: Session = Depends(get_d
 async def get_account():
     """
     Return account summary (equity, daily P&L, open positions).
+    
+    FIX 2: EXPLICIT REPLAY ISOLATION
+    This endpoint returns live paper trading state only.
+    Replay state is completely separate (different broker instance).
     """
     # Get current prices for all symbols with open positions
     current_prices = {}
@@ -261,7 +267,10 @@ async def get_metrics(db: Session = Depends(get_db)):
     """
     Return trading performance metrics computed from persisted data.
     Strategy-agnostic metrics that can be recomputed at any time.
+    
+    FIX 2: EXPLICIT REPLAY ISOLATION
     Only includes live trading data (replay_id is None).
+    Replay metrics are accessed via /replay/results endpoint.
     """
     # Fetch only live trading trades and equity curve data (replay_id is None)
     trades = db.query(Trade).filter(Trade.replay_id.is_(None)).all()
@@ -356,24 +365,30 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     # Store signal if not HOLD
     signal_stored = False
     if result["signal"] != "HOLD":
-        # AUDIT FIX: Prevent duplicate signal storage (idempotency check)
-        signal_time = datetime.fromtimestamp(new_candle["time"], tz=timezone.utc)
+        # FIX 1: CANONICAL TIME HANDLING
+        # Convert Unix timestamp (API boundary) to UTC datetime (internal representation)
+        signal_time = unix_to_utc_datetime(new_candle["time"])
+        ensure_utc_datetime(signal_time, f"signal timestamp for {symbol}")
+        
+        # FIX 2: EXPLICIT REPLAY ISOLATION
+        # Live trading: replay_id must be None
         existing_signal = db.query(Signal).filter(
             Signal.symbol == symbol,
             Signal.timestamp == signal_time,
-            Signal.signal == result["signal"]
+            Signal.signal == result["signal"],
+            Signal.replay_id.is_(None)  # Only check live trading signals
         ).first()
         
         if not existing_signal:
-            # AUDIT FIX: Use UTC explicitly for timezone consistency
-            # Live trading: replay_id is None
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Live trading: replay_id is None (replay data uses UUID)
             signal = Signal(
                 timestamp=signal_time,
                 symbol=symbol,
                 signal=result["signal"],
                 price=new_candle["close"],
                 reason=result["reason"],
-                replay_id=None  # None for live trading
+                replay_id=None  # None for live trading, UUID for replays
             )
             db.add(signal)
             db.commit()
@@ -396,14 +411,20 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     # Update trade records for stop-loss exits
     for exit_trade in stop_loss_exits:
         stop_loss_symbols.add(exit_trade["symbol"])
+        # FIX 2: EXPLICIT REPLAY ISOLATION
+        # Live trading: only query trades with replay_id=None
         open_trade = db.query(Trade).filter(
             Trade.symbol == exit_trade["symbol"],
-            Trade.exit_time.is_(None)
+            Trade.exit_time.is_(None),
+            Trade.replay_id.is_(None)  # Only live trading trades
         ).first()
         
         if open_trade:
-            # AUDIT FIX: Use UTC explicitly for timezone consistency
-            open_trade.exit_time = datetime.fromtimestamp(exit_trade["timestamp"], tz=timezone.utc)
+            # FIX 1: CANONICAL TIME HANDLING
+            # Convert Unix timestamp to UTC datetime
+            exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
+            ensure_utc_datetime(exit_time, f"stop-loss exit time for {exit_trade['symbol']}")
+            open_trade.exit_time = exit_time
             open_trade.exit_price = exit_trade["exit_price"]
             open_trade.pnl = exit_trade["pnl"]
             open_trade.reason = exit_trade["reason"]
@@ -433,19 +454,23 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
         )
         
         if trade_executed:
-            # Create trade record (entry only, exit will be added later)
-            # AUDIT FIX: Use UTC explicitly for timezone consistency
-            # Live trading: replay_id is None
+            # FIX 1: CANONICAL TIME HANDLING
+            # Convert Unix timestamp to UTC datetime
+            entry_time = unix_to_utc_datetime(new_candle["time"])
+            ensure_utc_datetime(entry_time, f"BUY entry time for {symbol}")
+            
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Live trading: replay_id is None (replay data uses UUID)
             trade = Trade(
                 symbol=symbol,
-                entry_time=datetime.fromtimestamp(new_candle["time"], tz=timezone.utc),
+                entry_time=entry_time,
                 entry_price=trade_executed["entry_price"],
                 shares=trade_executed["shares"],
                 exit_time=None,
                 exit_price=None,
                 pnl=None,
                 reason=None,
-                replay_id=None  # None for live trading
+                replay_id=None  # None for live trading, UUID for replays
             )
             db.add(trade)
             db.commit()
@@ -466,15 +491,20 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
         )
         
         if trade_executed:
-            # Find open trade and update with exit
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Live trading: only query trades with replay_id=None
             open_trade = db.query(Trade).filter(
                 Trade.symbol == symbol,
-                Trade.exit_time.is_(None)
+                Trade.exit_time.is_(None),
+                Trade.replay_id.is_(None)  # Only live trading trades
             ).first()
             
             if open_trade:
-                # AUDIT FIX: Use UTC explicitly for timezone consistency
-                open_trade.exit_time = datetime.fromtimestamp(new_candle["time"], tz=timezone.utc)
+                # FIX 1: CANONICAL TIME HANDLING
+                # Convert Unix timestamp to UTC datetime
+                exit_time = unix_to_utc_datetime(new_candle["time"])
+                ensure_utc_datetime(exit_time, f"EXIT time for {symbol}")
+                open_trade.exit_time = exit_time
                 open_trade.exit_price = trade_executed["exit_price"]
                 open_trade.pnl = trade_executed["pnl"]
                 open_trade.reason = trade_executed["reason"]
@@ -495,14 +525,20 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     
     # Update trade records for kill switch exits
     for exit_trade in kill_switch_exits:
+        # FIX 2: EXPLICIT REPLAY ISOLATION
+        # Live trading: only query trades with replay_id=None
         open_trade = db.query(Trade).filter(
             Trade.symbol == exit_trade["symbol"],
-            Trade.exit_time.is_(None)
+            Trade.exit_time.is_(None),
+            Trade.replay_id.is_(None)  # Only live trading trades
         ).first()
         
         if open_trade:
-            # AUDIT FIX: Use UTC explicitly for timezone consistency
-            open_trade.exit_time = datetime.fromtimestamp(exit_trade["timestamp"], tz=timezone.utc)
+            # FIX 1: CANONICAL TIME HANDLING
+            # Convert Unix timestamp to UTC datetime
+            exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
+            ensure_utc_datetime(exit_time, f"kill switch exit time for {exit_trade['symbol']}")
+            open_trade.exit_time = exit_time
             open_trade.exit_price = exit_trade["exit_price"]
             open_trade.pnl = exit_trade["pnl"]
             open_trade.reason = exit_trade["reason"]
@@ -518,12 +554,17 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
         kill_switch_triggered = True
     
     # Update equity curve (equity already updated above for risk checks)
-    # AUDIT FIX: Use UTC explicitly for timezone consistency
-    # Live trading: replay_id is None
+    # FIX 1: CANONICAL TIME HANDLING
+    # Convert Unix timestamp to UTC datetime
+    equity_timestamp = unix_to_utc_datetime(new_candle["time"])
+    ensure_utc_datetime(equity_timestamp, f"equity curve timestamp for {symbol}")
+    
+    # FIX 2: EXPLICIT REPLAY ISOLATION
+    # Live trading: replay_id is None (replay data uses UUID)
     equity_point = EquityCurve(
-        timestamp=datetime.fromtimestamp(new_candle["time"], tz=timezone.utc),
+        timestamp=equity_timestamp,
         equity=broker.equity,
-        replay_id=None  # None for live trading
+        replay_id=None  # None for live trading, UUID for replays
     )
     db.add(equity_point)
     db.commit()
@@ -633,19 +674,27 @@ async def websocket_endpoint(websocket: WebSocket):
 
 class ReplayRequest(BaseModel):
     symbol: str
-    candles: List[Dict]  # List of candle dicts: time, open, high, low, close, volume
+    candles: Optional[List[Dict]] = None  # Optional: if not provided, will fetch from Yahoo Finance
+    start_date: Optional[str] = None  # YYYY-MM-DD format, required if candles not provided
+    end_date: Optional[str] = None    # YYYY-MM-DD format, required if candles not provided
     replay_id: Optional[str] = None
 
 
 @app.post("/replay/start")
 async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
     """
-    Start a historical replay (backtest).
+    Start a historical replay (backtest) using real market data from Yahoo Finance.
+    
+    Can be called in two ways:
+    1. With pre-fetched candles: Provide 'candles' array
+    2. With date range: Provide 'start_date' and 'end_date' to fetch from Yahoo Finance
     
     Safeguards:
     - Prevents concurrent replay/live trading
     - Validates symbol in allowed universe
+    - Validates date range (max 1 year)
     - Validates candle ordering
+    - Ensures UTC datetime validation throughout
     """
     global replay_running
     
@@ -657,20 +706,69 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
     if request.symbol not in ALL_SYMBOLS:
         return {"error": f"Symbol {request.symbol} not in allowed list"}, 400
     
+    # Determine data source: candles provided OR dates provided
+    candles = None
+    source = "manual"
+    
+    if request.candles:
+        # Use provided candles
+        candles = request.candles
+        source = "manual"
+    elif request.start_date and request.end_date:
+        # Fetch from Yahoo Finance
+        try:
+            # Validate date format
+            start_dt = datetime.strptime(request.start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(request.end_date, "%Y-%m-%d")
+        except ValueError as e:
+            return {"error": f"Invalid date format. Use YYYY-MM-DD. Error: {e}"}, 400
+        
+        # Safeguard: Validate date range (max 1 year)
+        date_range = (end_dt - start_dt).days
+        if date_range > 365:
+            return {"error": f"Date range exceeds 1 year limit. Requested: {date_range} days"}, 400
+        
+        if date_range <= 0:
+            return {"error": "End date must be after start date"}, 400
+        
+        try:
+            # Fetch candles from Yahoo Finance
+            yahoo_candles = fetch_yahoo_candles(
+                symbol=request.symbol,
+                start_date=request.start_date,
+                end_date=request.end_date
+            )
+            
+            if not yahoo_candles:
+                return {"error": f"No valid candles returned for {request.symbol}"}, 400
+            
+            # Convert to replay format (Unix timestamps)
+            candles = convert_to_replay_format(yahoo_candles)
+            source = "yahoo_finance"
+            
+        except ValueError as e:
+            return {"error": str(e)}, 400
+        except Exception as e:
+            return {"error": f"Failed to fetch Yahoo Finance data: {str(e)}"}, 500
+    else:
+        return {"error": "Must provide either 'candles' array or both 'start_date' and 'end_date'"}, 400
+    
     # Safeguard: Validate candles
-    if not request.candles or len(request.candles) < 50:
+    if not candles or len(candles) < 50:
         return {"error": "Need at least 50 candles for replay (EMA(50) requires 50 candles)"}, 400
     
     try:
         replay_id = replay_engine.start_replay(
             symbol=request.symbol,
-            candles=request.candles,
-            replay_id=request.replay_id
+            candles=candles,
+            replay_id=request.replay_id,
+            source=source
         )
         
         replay_running = True
         
         # Run replay synchronously (in production, consider background task)
+        # Processes candles ONE AT A TIME through full pipeline
         result = replay_engine.run(db)
         
         replay_running = False
@@ -680,7 +778,8 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             "replay_id": replay_id,
             "symbol": request.symbol,
             "total_candles": result["total_candles"],
-            "final_equity": result["final_equity"]
+            "final_equity": result["final_equity"],
+            "source": source
         }
     
     except ValueError as e:
@@ -703,8 +802,13 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
     """
     Get replay results: trades, equity curve, and metrics.
     
+    FIX 2: EXPLICIT REPLAY ISOLATION
+    This endpoint returns ONLY replay data (replay_id = UUID).
+    Live trading data (replay_id = None) is never returned here.
+    Replay state never mutates live paper trading state.
+    
     Args:
-        replay_id: Replay identifier
+        replay_id: Replay identifier (UUID)
     """
     # Fetch trades for this replay
     trades = db.query(Trade).filter(
@@ -731,6 +835,82 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
         ],
         "metrics": metrics_snapshot.to_dict()
     }
+
+
+# ============================================================================
+# YAHOO FINANCE DATA ENDPOINTS
+# ============================================================================
+
+class YahooFetchRequest(BaseModel):
+    symbol: str
+    start_date: str  # YYYY-MM-DD
+    end_date: str    # YYYY-MM-DD
+
+
+@app.post("/data/yahoo/fetch")
+async def fetch_yahoo_data(request: YahooFetchRequest):
+    """
+    Fetch historical 5-minute candles from Yahoo Finance.
+    
+    Safeguards:
+    - Validates symbol is in approved universe (Nasdaq-100, Dow-30)
+    - Limits date range to 1 year maximum
+    - Returns normalized candles ready for replay
+    
+    Args:
+        request: YahooFetchRequest with symbol, start_date, end_date
+    """
+    # Safeguard: Validate symbol
+    if request.symbol not in ALL_SYMBOLS:
+        return {"error": f"Symbol {request.symbol} not in approved universe (Nasdaq-100, Dow-30)"}, 400
+    
+    # Safeguard: Validate date range (max 1 year)
+    try:
+        start_dt = datetime.strptime(request.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(request.end_date, "%Y-%m-%d")
+    except ValueError as e:
+        return {"error": f"Invalid date format. Use YYYY-MM-DD. Error: {e}"}, 400
+    
+    # Check date range
+    date_range = (end_dt - start_dt).days
+    if date_range > 365:
+        return {"error": f"Date range exceeds 1 year limit. Requested: {date_range} days"}, 400
+    
+    if date_range <= 0:
+        return {"error": "End date must be after start date"}, 400
+    
+    try:
+        # Fetch candles from Yahoo Finance
+        candles = fetch_yahoo_candles(
+            symbol=request.symbol,
+            start_date=request.start_date,
+            end_date=request.end_date
+        )
+        
+        if not candles:
+            return {"error": f"No valid candles returned for {request.symbol}"}, 400
+        
+        # Convert to replay format (Unix timestamps)
+        replay_candles = convert_to_replay_format(candles)
+        
+        # Return response with metadata
+        return {
+            "symbol": request.symbol,
+            "source": "yahoo_finance",
+            "candle_count": len(replay_candles),
+            "start_timestamp": replay_candles[0]["time"] if replay_candles else None,
+            "end_timestamp": replay_candles[-1]["time"] if replay_candles else None,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "sample_first": replay_candles[0] if replay_candles else None,
+            "sample_last": replay_candles[-1] if replay_candles else None,
+            "candles": replay_candles  # Full candle list for replay
+        }
+    
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    except Exception as e:
+        return {"error": f"Failed to fetch Yahoo Finance data: {str(e)}"}, 500
 
 
 if __name__ == "__main__":
