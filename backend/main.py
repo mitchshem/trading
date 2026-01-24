@@ -856,6 +856,41 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             # Compute metrics for determinism verification and summary
             metrics_snapshot = compute_metrics(trades, equity_curve)
             
+            # Generate performance report
+            closed_trades = [t for t in trades if t.exit_time is not None]
+            stop_loss_trades = [t for t in closed_trades if t.reason and "STOP_LOSS" in t.reason.upper()]
+            stop_loss_pct = (len(stop_loss_trades) / len(closed_trades) * 100) if len(closed_trades) > 0 else 0.0
+            
+            replay_report = {
+                "symbol": request.symbol,
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+                "candles_processed": result["total_candles"],
+                "trades_executed": len(trades),
+                "win_rate": metrics_snapshot.core_metrics.win_rate,
+                "net_pnl": net_pnl,
+                "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
+                "sharpe_proxy": metrics_snapshot.risk_adjusted.sharpe_proxy if metrics_snapshot.risk_adjusted.sharpe_proxy is not None else None,
+                "stop_loss_pct": round(stop_loss_pct, 2)
+            }
+            
+            # Print performance report to console
+            print("\n" + "=" * 60)
+            print("HISTORICAL REPLAY RESULTS (No Optimization)")
+            print("=" * 60)
+            print(f"Symbol: {replay_report['symbol']}")
+            if replay_report['start_date'] and replay_report['end_date']:
+                print(f"Date Range: {replay_report['start_date']} → {replay_report['end_date']}")
+            print(f"Candles Processed: {replay_report['candles_processed']:,}")
+            print(f"Trades Executed: {replay_report['trades_executed']}")
+            print(f"Win Rate: {replay_report['win_rate']:.2f}%")
+            print(f"Net P&L: ${replay_report['net_pnl']:,.2f}")
+            print(f"Max Drawdown: {replay_report['max_drawdown_pct']:.2f}%")
+            sharpe_display = f"{replay_report['sharpe_proxy']:.2f}" if replay_report['sharpe_proxy'] is not None else "N/A"
+            print(f"Sharpe Proxy: {sharpe_display}")
+            print(f"Stop-Loss Exits: {replay_report['stop_loss_pct']:.2f}% of trades")
+            print("=" * 60 + "\n")
+            
             # DETERMINISM VERIFICATION: Check if same inputs produce same outputs
             # Create replay fingerprint: symbol + date range + candle count
             replay_fingerprint = f"{request.symbol}|{request.start_date}|{request.end_date}|{result['total_candles']}"
@@ -998,7 +1033,8 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 "determinism_status": determinism_status,
                 "determinism_message": determinism_message,
                 "determinism_mismatches": determinism_mismatches,
-                "replay_fingerprint": replay_fingerprint
+                "replay_fingerprint": replay_fingerprint,
+                "report": replay_report
             }
         
         except Exception as e:

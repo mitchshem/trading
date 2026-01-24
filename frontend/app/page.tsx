@@ -1290,7 +1290,90 @@ export default function Home() {
           </div>
         )}
         
-        {replayResults && replayResults.metrics && (
+        {/* Performance Report */}
+        {replayResults && replayResults.report && (
+          <div style={{ 
+            padding: '16px', 
+            backgroundColor: '#1a1a1a', 
+            borderRadius: '4px',
+            marginBottom: '16px',
+            border: '1px solid #3a3a3a'
+          }}>
+            <h3 style={{ 
+              color: '#d1d5db', 
+              fontSize: '16px', 
+              fontWeight: '600', 
+              marginBottom: '16px',
+              borderBottom: '1px solid #3a3a3a',
+              paddingBottom: '8px'
+            }}>
+              Historical Replay Results (No Optimization)
+            </h3>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px', fontSize: '14px' }}>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Symbol</div>
+                <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                  {replayResults.report.symbol || 'N/A'}
+                </div>
+              </div>
+              {replayResults.report.start_date && replayResults.report.end_date && (
+                <div>
+                  <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Date Range</div>
+                  <div style={{ color: '#ffffff', fontWeight: '600', fontSize: '13px' }}>
+                    {replayResults.report.start_date} → {replayResults.report.end_date}
+                  </div>
+                </div>
+              )}
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Candles Processed</div>
+                <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                  {replayResults.report.candles_processed.toLocaleString()}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Trades Executed</div>
+                <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                  {replayResults.report.trades_executed}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Win Rate</div>
+                <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                  {replayResults.report.win_rate.toFixed(2)}%
+                </div>
+              </div>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Net P&L</div>
+                <div style={{ 
+                  color: replayResults.report.net_pnl >= 0 ? '#26a69a' : '#ef5350',
+                  fontWeight: '600'
+                }}>
+                  ${replayResults.report.net_pnl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Max Drawdown</div>
+                <div style={{ color: '#ef5350', fontWeight: '600' }}>
+                  {replayResults.report.max_drawdown_pct.toFixed(2)}%
+                </div>
+              </div>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Sharpe Proxy</div>
+                <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                  {replayResults.report.sharpe_proxy !== null ? replayResults.report.sharpe_proxy.toFixed(2) : 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '4px' }}>Stop-Loss Exits</div>
+                <div style={{ color: '#ffffff', fontWeight: '600' }}>
+                  {replayResults.report.stop_loss_pct.toFixed(2)}% of trades
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        
+        {replayResults && replayResults.metrics && !replayResults.report && (
           <div style={{ 
             padding: '12px', 
             backgroundColor: '#1a1a1a', 
