@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { createChart, IChartApi, ISeriesApi } from 'lightweight-charts'
 
 const API_BASE = 'http://localhost:8000'
@@ -415,7 +415,7 @@ export default function Home() {
   useEffect(() => {
     if (!equitySeriesRef.current || equityCurve.length === 0) return
 
-    const equityData = equityCurve.map(point => ({
+    const equityData = equityCurve.map((point: EquityPoint) => ({
       time: Math.floor(new Date(point.timestamp).getTime() / 1000) as any,
       value: point.equity,
     }))
@@ -571,7 +571,7 @@ export default function Home() {
         <select
           id="symbol-select"
           value={selectedSymbol}
-          onChange={(e) => setSelectedSymbol(e.target.value)}
+          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedSymbol(e.target.value)}
           style={{
             padding: '8px 12px',
             fontSize: '16px',
@@ -582,7 +582,7 @@ export default function Home() {
             cursor: 'pointer',
           }}
         >
-          {symbols.map(symbol => (
+          {symbols.map((symbol: string) => (
             <option key={symbol} value={symbol}>
               {symbol}
             </option>
@@ -684,7 +684,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {account.open_positions.map((pos, idx) => (
+                  {account.open_positions.map((pos: Account['open_positions'][0], idx: number) => (
                     <tr key={idx} style={{ borderBottom: '1px solid #3a3a3a' }}>
                       <td style={{ padding: '8px', color: '#d1d5db', fontWeight: '600' }}>{pos.symbol}</td>
                       <td style={{ padding: '8px', textAlign: 'right', color: '#d1d5db' }}>{pos.shares}</td>
@@ -739,7 +739,7 @@ export default function Home() {
                 </tr>
               </thead>
               <tbody>
-                {trades.map((trade) => (
+                {trades.map((trade: Trade) => (
                   <tr key={trade.id} style={{ borderBottom: '1px solid #3a3a3a' }}>
                     <td style={{ padding: '8px', color: '#d1d5db', fontWeight: '600' }}>{trade.symbol}</td>
                     <td style={{ padding: '8px', color: '#d1d5db' }}>
@@ -963,14 +963,14 @@ export default function Home() {
           Historical Replay (Backtest)
         </h2>
         
-        <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginBottom: '16px' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center', marginBottom: '16px' }}>
           <label htmlFor="replay-symbol-select" style={{ fontSize: '14px', fontWeight: '500' }}>
             Symbol:
           </label>
           <select
             id="replay-symbol-select"
             value={replaySymbol}
-            onChange={(e) => setReplaySymbol(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setReplaySymbol(e.target.value)}
             disabled={isReplayRunning}
             style={{
               padding: '6px 10px',
@@ -983,12 +983,52 @@ export default function Home() {
             }}
           >
             <option value="">Select symbol</option>
-            {symbols.map(symbol => (
+            {symbols.map((symbol: string) => (
               <option key={symbol} value={symbol}>
                 {symbol}
               </option>
             ))}
           </select>
+          
+          <label htmlFor="replay-start-date" style={{ fontSize: '14px', fontWeight: '500', marginLeft: '12px' }}>
+            Start Date:
+          </label>
+          <input
+            id="replay-start-date"
+            type="date"
+            value={replayStartDate}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setReplayStartDate(e.target.value)}
+            disabled={isReplayRunning}
+            style={{
+              padding: '6px 10px',
+              fontSize: '14px',
+              backgroundColor: '#1a1a1a',
+              color: '#ffffff',
+              border: '1px solid #3a3a3a',
+              borderRadius: '4px',
+              cursor: isReplayRunning ? 'not-allowed' : 'pointer',
+            }}
+          />
+          
+          <label htmlFor="replay-end-date" style={{ fontSize: '14px', fontWeight: '500', marginLeft: '12px' }}>
+            End Date:
+          </label>
+          <input
+            id="replay-end-date"
+            type="date"
+            value={replayEndDate}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setReplayEndDate(e.target.value)}
+            disabled={isReplayRunning}
+            style={{
+              padding: '6px 10px',
+              fontSize: '14px',
+              backgroundColor: '#1a1a1a',
+              color: '#ffffff',
+              border: '1px solid #3a3a3a',
+              borderRadius: '4px',
+              cursor: isReplayRunning ? 'not-allowed' : 'pointer',
+            }}
+          />
           
           <button
             onClick={async () => {
@@ -997,28 +1037,24 @@ export default function Home() {
                 return
               }
               
+              if (!replayStartDate || !replayEndDate) {
+                alert('Please select both start and end dates')
+                return
+              }
+              
               setIsReplayRunning(true)
               setReplayStatus(null)
               setReplayResults(null)
               
               try {
-                // Fetch historical candles for the symbol
-                const candlesRes = await fetch(`${API_BASE}/candles?symbol=${replaySymbol}&limit=500`)
-                const candlesData = await candlesRes.json()
-                
-                if (!candlesData.candles || candlesData.candles.length < 50) {
-                  alert('Need at least 50 candles for replay')
-                  setIsReplayRunning(false)
-                  return
-                }
-                
-                // Start replay
+                // Start replay with date range (will fetch from Yahoo Finance automatically)
                 const replayRes = await fetch(`${API_BASE}/replay/start`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     symbol: replaySymbol,
-                    candles: candlesData.candles
+                    start_date: replayStartDate,
+                    end_date: replayEndDate
                   })
                 })
                 
@@ -1039,7 +1075,8 @@ export default function Home() {
                   status: 'completed',
                   replay_id: replayData.replay_id,
                   total_candles: replayData.total_candles,
-                  final_equity: replayData.final_equity
+                  final_equity: replayData.final_equity,
+                  source: replayData.source || 'yahoo_finance'
                 })
                 
                 // FIX 2: EXPLICIT REPLAY ISOLATION
@@ -1053,16 +1090,16 @@ export default function Home() {
                 setIsReplayRunning(false)
               }
             }}
-            disabled={isReplayRunning || !replaySymbol}
+            disabled={isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate}
             style={{
               padding: '8px 16px',
               fontSize: '14px',
               fontWeight: '600',
-              backgroundColor: isReplayRunning || !replaySymbol ? '#3a3a3a' : '#26a69a',
+              backgroundColor: isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate ? '#3a3a3a' : '#26a69a',
               color: '#ffffff',
               border: 'none',
               borderRadius: '4px',
-              cursor: isReplayRunning || !replaySymbol ? 'not-allowed' : 'pointer',
+              cursor: isReplayRunning || !replaySymbol || !replayStartDate || !replayEndDate ? 'not-allowed' : 'pointer',
             }}
           >
             {isReplayRunning ? 'Running...' : 'Start Replay'}
