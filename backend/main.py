@@ -1099,6 +1099,27 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
     # Compute metrics
     metrics_snapshot = compute_metrics(trades, equity_curve)
     
+    # Generate performance report
+    closed_trades = [t for t in trades if t.exit_time is not None]
+    stop_loss_trades = [t for t in closed_trades if t.reason and "STOP_LOSS" in t.reason.upper()]
+    stop_loss_pct = (len(stop_loss_trades) / len(closed_trades) * 100) if len(closed_trades) > 0 else 0.0
+    
+    initial_equity = summary.final_equity - summary.net_pnl if summary else 100000.0
+    net_pnl = summary.net_pnl if summary else (metrics_snapshot.equity_end - metrics_snapshot.equity_start)
+    
+    replay_report = {
+        "symbol": summary.symbol if summary else None,
+        "start_date": summary.start_date if summary else None,
+        "end_date": summary.end_date if summary else None,
+        "candles_processed": summary.candle_count if summary else 0,
+        "trades_executed": len(trades),
+        "win_rate": metrics_snapshot.core_metrics.win_rate,
+        "net_pnl": net_pnl,
+        "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
+        "sharpe_proxy": metrics_snapshot.risk_adjusted.sharpe_proxy if metrics_snapshot.risk_adjusted.sharpe_proxy is not None else None,
+        "stop_loss_pct": round(stop_loss_pct, 2)
+    }
+    
     return {
         "replay_id": replay_id,
         "symbol": summary.symbol if summary else None,
@@ -1106,6 +1127,7 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
         "end_date": summary.end_date if summary else None,
         "source": summary.source if summary else None,
         "metrics": metrics_snapshot.to_dict(),  # Metrics are easy to find at top level
+        "report": replay_report,  # Performance report (No Optimization)
         "trades": [t.to_dict() for t in trades],
         "equity_curve": [
             {
