@@ -870,7 +870,30 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                     else:
                         print(f"[DETERMINISM VERIFIED] Replay {replay_id} matches previous replay {prev.replay_id} for same inputs")
             
-            # Log determinism metrics
+            # Calculate net P&L (final_equity - initial_equity)
+            initial_equity = replay_engine.initial_equity
+            net_pnl = result["final_equity"] - initial_equity
+            
+            # CONSOLE OUTPUT FOR HUMANS: Print concise, copy-pasteable summary
+            print("\n" + "=" * 50)
+            print("REPLAY COMPLETE")
+            print("=" * 50)
+            print(f"Symbol: {request.symbol}")
+            if request.start_date and request.end_date:
+                print(f"Date range: {request.start_date} → {request.end_date}")
+            else:
+                print(f"Date range: Manual candles")
+            print(f"Candles processed: {result['total_candles']:,}")
+            print(f"Trades executed: {len(trades)}")
+            print(f"Final equity: ${result['final_equity']:,.2f}")
+            print(f"Net P&L: ${net_pnl:,.2f}")
+            print(f"Max drawdown: {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+            sharpe_display = f"{metrics_snapshot.risk_adjusted.sharpe_proxy:.2f}" if metrics_snapshot.risk_adjusted.sharpe_proxy is not None else "N/A"
+            print(f"Sharpe proxy: {sharpe_display}")
+            print(f"Replay ID: {replay_id}")
+            print("=" * 50 + "\n")
+            
+            # Log determinism metrics (for debugging)
             print(f"[DETERMINISM] Replay {replay_id} completed:")
             print(f"  Symbol: {request.symbol}")
             print(f"  Date range: {request.start_date} to {request.end_date}")
@@ -889,8 +912,10 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 candle_count=result["total_candles"],
                 trade_count=len(trades),
                 final_equity=result["final_equity"],
+                net_pnl=net_pnl,
                 max_drawdown_pct=metrics_snapshot.risk_metrics.max_drawdown_pct,
                 max_drawdown_absolute=metrics_snapshot.risk_metrics.max_drawdown_absolute,
+                sharpe_proxy=metrics_snapshot.risk_adjusted.sharpe_proxy,
                 timestamp_completed=datetime.now(timezone.utc)
             )
             db.add(replay_summary)
@@ -943,9 +968,21 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
     Live trading data (replay_id = None) is never returned here.
     Replay state never mutates live paper trading state.
     
+    Returns:
+    - symbol: Trading symbol
+    - start_date, end_date: Date range (if available)
+    - metrics: Full metrics snapshot (easy to find)
+    - trades: List of trades (optional detail)
+    - equity_curve: Equity curve data (optional detail)
+    
     Args:
         replay_id: Replay identifier (UUID)
     """
+    # Fetch replay summary for symbol and date range
+    summary = db.query(ReplaySummary).filter(
+        ReplaySummary.replay_id == replay_id
+    ).first()
+    
     # Fetch trades for this replay
     trades = db.query(Trade).filter(
         Trade.replay_id == replay_id
@@ -961,6 +998,11 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
     
     return {
         "replay_id": replay_id,
+        "symbol": summary.symbol if summary else None,
+        "start_date": summary.start_date if summary else None,
+        "end_date": summary.end_date if summary else None,
+        "source": summary.source if summary else None,
+        "metrics": metrics_snapshot.to_dict(),  # Metrics are easy to find at top level
         "trades": [t.to_dict() for t in trades],
         "equity_curve": [
             {
@@ -968,24 +1010,35 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
                 "equity": point.equity
             }
             for point in equity_curve
-        ],
-        "metrics": metrics_snapshot.to_dict()
+        ]
     }
 
 
 @app.get("/replay/history")
 async def get_replay_history(limit: int = 100, db: Session = Depends(get_db)):
     """
-    Get history of completed replays for evaluation.
+    Get history of completed replays for evaluation and inspection.
     
-    Returns list of replay summaries sorted by completion time (newest first).
+    Returns JSON array of replay summaries sorted by completion time (newest first).
+    Each summary includes all fields needed for easy inspection and sharing:
+    - replay_id, symbol, start_date, end_date
+    - candle_count, trade_count, final_equity
+    - net_pnl, max_drawdown_pct, sharpe_proxy
+    - timestamp_completed
+    
     Used for:
     - Tracking replay runs
     - Determinism verification (comparing same inputs across runs)
     - Performance evaluation over time
+    - Easy inspection and sharing of results
     
     Args:
         limit: Maximum number of summaries to return (default: 100)
+    
+    Returns:
+        JSON object with:
+        - replay_summaries: Array of replay summary objects
+        - count: Number of summaries returned
     """
     summaries = db.query(ReplaySummary).order_by(
         ReplaySummary.timestamp_completed.desc()

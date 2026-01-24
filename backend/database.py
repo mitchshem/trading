@@ -130,8 +130,10 @@ class ReplaySummary(Base):
     candle_count = Column(Integer, nullable=False)
     trade_count = Column(Integer, nullable=False)
     final_equity = Column(Float, nullable=False)
+    net_pnl = Column(Float, nullable=False)  # Net P&L (final_equity - initial_equity)
     max_drawdown_pct = Column(Float, nullable=False)
     max_drawdown_absolute = Column(Float, nullable=False)
+    sharpe_proxy = Column(Float, nullable=True)  # Risk-adjusted metric
     # FIX 1: CANONICAL TIME HANDLING - UTC timezone-aware datetime only
     timestamp_completed = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
@@ -146,8 +148,10 @@ class ReplaySummary(Base):
             "candle_count": self.candle_count,
             "trade_count": self.trade_count,
             "final_equity": self.final_equity,
+            "net_pnl": self.net_pnl,
             "max_drawdown_pct": self.max_drawdown_pct,
             "max_drawdown_absolute": self.max_drawdown_absolute,
+            "sharpe_proxy": self.sharpe_proxy,
             "timestamp_completed": self.timestamp_completed.isoformat() if self.timestamp_completed else None
         }
 
