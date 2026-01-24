@@ -1147,7 +1147,11 @@ export default function Home() {
                   replay_id: replayData.replay_id,
                   total_candles: replayData.total_candles,
                   final_equity: replayData.final_equity,
-                  source: replayData.source || 'yahoo_finance'
+                  source: replayData.source || 'yahoo_finance',
+                  determinism_status: replayData.determinism_status,
+                  determinism_message: replayData.determinism_message,
+                  determinism_mismatches: replayData.determinism_mismatches,
+                  replay_fingerprint: replayData.replay_fingerprint
                 })
                 
                 // Populate UI with replay results

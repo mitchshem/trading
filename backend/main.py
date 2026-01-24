@@ -857,6 +857,13 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             metrics_snapshot = compute_metrics(trades, equity_curve)
             
             # DETERMINISM VERIFICATION: Check if same inputs produce same outputs
+            # Create replay fingerprint: symbol + date range + candle count
+            replay_fingerprint = f"{request.symbol}|{request.start_date}|{request.end_date}|{result['total_candles']}"
+            
+            determinism_status = "no_previous_run"  # Default: no previous run to compare
+            determinism_message = None
+            determinism_mismatches = None
+            
             # Look for previous replays with same symbol and date range
             if request.start_date and request.end_date:
                 previous_replays = db.query(ReplaySummary).filter(
@@ -868,6 +875,8 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 
                 if previous_replays:
                     prev = previous_replays[0]
+                    prev_fingerprint = f"{prev.symbol}|{prev.start_date}|{prev.end_date}|{prev.candle_count}"
+                    
                     # Verify determinism: same inputs should produce same outputs
                     mismatches = []
                     
@@ -881,12 +890,48 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                         mismatches.append(f"max_drawdown_pct: {prev.max_drawdown_pct:.2f}% vs {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
                     
                     if mismatches:
-                        error_msg = f"DETERMINISM VIOLATION: Replay {replay_id} produced different results than previous replay {prev.replay_id} for same inputs ({request.symbol}, {request.start_date} to {request.end_date}). Mismatches: {', '.join(mismatches)}"
-                        print(f"[ERROR] {error_msg}")
-                        # Don't fail the replay, but log the violation clearly
-                        # In production, you might want to raise an exception here
+                        # DETERMINISM VIOLATION: Raise clear error and log both results
+                        determinism_status = "mismatch"
+                        determinism_message = f"DETERMINISM VIOLATION: Mismatch detected"
+                        determinism_mismatches = mismatches
+                        
+                        # Log both results for inspection
+                        print("\n" + "=" * 60)
+                        print("[ERROR] DETERMINISM VIOLATION DETECTED")
+                        print("=" * 60)
+                        print(f"Replay Fingerprint: {replay_fingerprint}")
+                        print(f"Previous Replay ID: {prev.replay_id}")
+                        print(f"Current Replay ID: {replay_id}")
+                        print(f"\nPrevious Run Results:")
+                        print(f"  Candle count: {prev.candle_count}")
+                        print(f"  Trade count: {prev.trade_count}")
+                        print(f"  Final equity: {prev.final_equity:.2f}")
+                        print(f"  Max drawdown: {prev.max_drawdown_pct:.2f}%")
+                        print(f"\nCurrent Run Results:")
+                        print(f"  Candle count: {result['total_candles']}")
+                        print(f"  Trade count: {len(trades)}")
+                        print(f"  Final equity: {result['final_equity']:.2f}")
+                        print(f"  Max drawdown: {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+                        print(f"\nMismatches: {', '.join(mismatches)}")
+                        print("=" * 60 + "\n")
+                        
+                        # Raise error to fail fast
+                        raise ValueError(f"DETERMINISM VIOLATION: Same inputs produced different results. Mismatches: {', '.join(mismatches)}")
                     else:
-                        print(f"[DETERMINISM VERIFIED] Replay {replay_id} matches previous replay {prev.replay_id} for same inputs")
+                        # DETERMINISM VERIFIED: Same inputs produced same outputs
+                        determinism_status = "verified"
+                        determinism_message = "Deterministic replay confirmed"
+                        print(f"\n[DETERMINISM VERIFIED] Replay {replay_id} matches previous replay {prev.replay_id}")
+                        print(f"Replay Fingerprint: {replay_fingerprint}")
+                        print(f"All metrics match: candle_count={result['total_candles']}, trade_count={len(trades)}, final_equity={result['final_equity']:.2f}, max_drawdown={metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%\n")
+                else:
+                    # No previous run to compare
+                    determinism_status = "no_previous_run"
+                    determinism_message = "No previous run to compare (first run for this input)"
+                    print(f"[DETERMINISM] First run for fingerprint: {replay_fingerprint}")
+            
+            # Log replay fingerprint for tracking
+            print(f"[DETERMINISM] Replay fingerprint: {replay_fingerprint}")
             
             # Calculate net P&L (final_equity - initial_equity)
             initial_equity = replay_engine.initial_equity
@@ -949,7 +994,11 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 "final_equity": result["final_equity"],
                 "trade_count": len(trades),
                 "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
-                "source": source
+                "source": source,
+                "determinism_status": determinism_status,
+                "determinism_message": determinism_message,
+                "determinism_mismatches": determinism_mismatches,
+                "replay_fingerprint": replay_fingerprint
             }
         
         except Exception as e:
