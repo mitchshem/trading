@@ -181,10 +181,34 @@ async def get_candles(symbol: str, limit: int = 500):
     """
     Return historical candle data for a symbol.
     Currently returns synthetic data.
+    
+    BUG FIX: Preserves existing candle history if:
+    - An active WebSocket connection is streaming candles for this symbol
+    - Candle history already exists and has accumulated candles
+    
+    This prevents overwriting accumulated candle history that's being used
+    by active strategy evaluation, which would cause loss of historical context
+    and potentially incorrect signals.
     """
     if symbol not in ALL_SYMBOLS:
         return {"error": f"Symbol {symbol} not in allowed list"}, 400
     
+    # BUG FIX: Check if there's an active WebSocket connection for this symbol
+    has_active_websocket = symbol in active_connections and len(active_connections[symbol]) > 0
+    
+    # BUG FIX: Preserve existing candle history if:
+    # 1. There's an active WebSocket streaming candles, OR
+    # 2. Candle history already exists and has candles
+    if has_active_websocket or (symbol in candle_history and len(candle_history[symbol]) > 0):
+        # Return existing history without overwriting
+        existing_candles = candle_history[symbol]
+        return {
+            "symbol": symbol,
+            "candles": existing_candles[-limit:] if len(existing_candles) > limit else existing_candles,
+            "note": "Returning existing candle history (preserved due to active stream or existing history)"
+        }
+    
+    # No active stream and no existing history - generate new candles
     candles = generate_synthetic_candles(symbol, limit)
     
     # Store candle history for strategy evaluation
