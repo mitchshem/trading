@@ -856,6 +856,10 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             # Compute metrics for determinism verification and summary
             metrics_snapshot = compute_metrics(trades, equity_curve)
             
+            # Calculate net P&L (final_equity - initial_equity)
+            initial_equity = replay_engine.initial_equity
+            net_pnl = result["final_equity"] - initial_equity
+            
             # Generate performance report
             closed_trades = [t for t in trades if t.exit_time is not None]
             stop_loss_trades = [t for t in closed_trades if t.reason and "STOP_LOSS" in t.reason.upper()]
@@ -967,10 +971,6 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             
             # Log replay fingerprint for tracking
             print(f"[DETERMINISM] Replay fingerprint: {replay_fingerprint}")
-            
-            # Calculate net P&L (final_equity - initial_equity)
-            initial_equity = replay_engine.initial_equity
-            net_pnl = result["final_equity"] - initial_equity
             
             # CONSOLE OUTPUT FOR HUMANS: Print concise, copy-pasteable summary
             print("\n" + "=" * 50)
