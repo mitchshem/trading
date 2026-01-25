@@ -4,6 +4,7 @@ from typing import List, Dict, Optional
 import asyncio
 import random
 import time
+import math
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -15,7 +16,24 @@ from paper_broker import PaperBroker
 from metrics import compute_metrics
 from replay_engine import ReplayEngine
 from market_data.yahoo import fetch_yahoo_candles, convert_to_replay_format
+from market_data.csv_loader import load_csv_candles, convert_to_replay_format as csv_convert_to_replay_format
 from utils import ensure_utc_datetime, unix_to_utc_datetime
+
+# ============================================================================
+# STARTUP INSTRUCTIONS
+# ============================================================================
+# To run this FastAPI application:
+#   1. Activate the virtual environment:
+#      macOS/Linux: source venv/bin/activate
+#      Windows: venv\Scripts\activate
+#   2. Start the server:
+#      python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+#
+# Why use 'python -m uvicorn' instead of just 'uvicorn'?
+# - Ensures uvicorn runs from the activated virtual environment
+# - Prevents "command not found" errors if uvicorn isn't in system PATH
+# - Works consistently across different operating systems
+# ============================================================================
 
 app = FastAPI(title="Paper Trading API")
 
@@ -72,7 +90,8 @@ NASDAQ_100 = [
 ]
 
 # Combine and deduplicate (some symbols appear in both)
-ALL_SYMBOLS = sorted(list(set(DOW_30 + NASDAQ_100)))
+# Add SPY (S&P 500 ETF) for reliable daily data testing
+ALL_SYMBOLS = sorted(list(set(DOW_30 + NASDAQ_100 + ["SPY"])))
 
 # Store active WebSocket connections
 active_connections: Dict[str, List[WebSocket]] = {}
@@ -722,6 +741,12 @@ class ReplayRequest(BaseModel):
     replay_id: Optional[str] = None
 
 
+class ReplayCsvRequest(BaseModel):
+    symbol: str
+    csv_path: str
+    replay_id: Optional[str] = None
+
+
 @app.post("/replay/start")
 async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
     """
@@ -775,41 +800,81 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
         
         try:
             # Fetch candles from Yahoo Finance
+            print(f"[REPLAY] Fetching DAILY candles from Yahoo Finance for {request.symbol}")
             yahoo_candles = fetch_yahoo_candles(
                 symbol=request.symbol,
                 start_date=request.start_date,
                 end_date=request.end_date
             )
             
-            if not yahoo_candles:
-                return {"error": f"No valid candles returned for {request.symbol}"}, 400
+            # PREFLIGHT VALIDATION: Check if candle count == 0
+            if not yahoo_candles or len(yahoo_candles) == 0:
+                error_msg = f"No DAILY data returned from Yahoo Finance for {request.symbol} between {request.start_date} and {request.end_date}"
+                print(f"[REPLAY] ERROR: {error_msg}")
+                return {"error": error_msg}, 400
+            
+            print(f"[REPLAY] Fetched {len(yahoo_candles)} daily candles from Yahoo Finance")
             
             # Convert to replay format (Unix timestamps)
             candles = convert_to_replay_format(yahoo_candles)
             source = "yahoo_finance"
             
+            # PREFLIGHT VALIDATION: Check candle count after conversion
+            if not candles or len(candles) == 0:
+                error_msg = f"No valid candles after conversion for {request.symbol}"
+                print(f"[REPLAY] ERROR: {error_msg}")
+                return {"error": error_msg}, 400
+            
+            print(f"[REPLAY] Converted to replay format: {len(candles)} candles")
+            
         except ValueError as e:
-            return {"error": str(e)}, 400
+            error_msg = str(e)
+            print(f"[REPLAY] ERROR: {error_msg}")
+            return {"error": error_msg}, 400
         except Exception as e:
-            return {"error": f"Failed to fetch Yahoo Finance data: {str(e)}"}, 500
+            error_msg = f"Failed to fetch Yahoo Finance data: {str(e)}"
+            print(f"[REPLAY] ERROR: {error_msg}")
+            return {"error": error_msg}, 500
     else:
         return {"error": "Must provide either 'candles' array or both 'start_date' and 'end_date'"}, 400
     
     # GUARDRAILS: Validate candles meet minimum thresholds
-    MIN_CANDLES_FOR_REPLAY = 500  # Minimum for meaningful evaluation
+    # For daily candles, a year has ~252 trading days, so 500 is too high
+    # Use lower threshold for daily data
+    MIN_CANDLES_FOR_REPLAY_DAILY = 50  # Minimum for daily data (about 2.5 months)
+    MIN_CANDLES_FOR_REPLAY_INTRADAY = 500  # Minimum for intraday data
     MIN_CANDLES_FOR_INDICATORS = 50  # Minimum for EMA(50)
     
-    if not candles:
-        return {"error": "No candles provided"}, 400
+    # Determine minimum based on data source
+    if source == "yahoo_finance":
+        # Daily candles: use lower threshold
+        MIN_CANDLES_FOR_REPLAY = MIN_CANDLES_FOR_REPLAY_DAILY
+    else:
+        # Manual/intraday candles: use higher threshold
+        MIN_CANDLES_FOR_REPLAY = MIN_CANDLES_FOR_REPLAY_INTRADAY
+    
+    # PREFLIGHT VALIDATION: Check if candle count == 0 (must be explicit, no silent exit)
+    if not candles or len(candles) == 0:
+        error_msg = f"No candles provided for replay"
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 400
+    
+    print(f"[REPLAY] Preflight validation: {len(candles)} candles, minimum required: {MIN_CANDLES_FOR_INDICATORS} for indicators, {MIN_CANDLES_FOR_REPLAY} for replay")
     
     if len(candles) < MIN_CANDLES_FOR_INDICATORS:
-        return {"error": f"Need at least {MIN_CANDLES_FOR_INDICATORS} candles for replay (EMA(50) requires {MIN_CANDLES_FOR_INDICATORS} candles)"}, 400
+        error_msg = f"Need at least {MIN_CANDLES_FOR_INDICATORS} candles for replay (EMA(50) requires {MIN_CANDLES_FOR_INDICATORS} candles). Got {len(candles)}"
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 400
     
     if len(candles) < MIN_CANDLES_FOR_REPLAY:
+        error_msg = f"Insufficient candles for meaningful evaluation. Got {len(candles)}, minimum {MIN_CANDLES_FOR_REPLAY} required."
+        print(f"[REPLAY] ERROR: {error_msg}")
         return {
-            "error": f"Insufficient candles for meaningful evaluation. Got {len(candles)}, minimum {MIN_CANDLES_FOR_REPLAY} required.",
+            "error": error_msg,
             "warning": f"Replay with fewer than {MIN_CANDLES_FOR_REPLAY} candles may not provide reliable performance metrics"
         }, 400
+    
+    print(f"[REPLAY] Preflight validation PASSED: {len(candles)} candles ready for replay")
     
     # GUARDRAILS: Validate date range if provided
     if request.start_date and request.end_date:
@@ -829,6 +894,7 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             pass  # Date validation already done above
     
     try:
+        print(f"[REPLAY] Starting replay for {request.symbol} with {len(candles)} candles")
         replay_id = replay_engine.start_replay(
             symbol=request.symbol,
             candles=candles,
@@ -836,13 +902,17 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             source=source
         )
         
+        print(f"[REPLAY] Replay started with replay_id={replay_id}")
         replay_running = True
         
         # MULTI-RUN SAFETY: Ensure replay state is always cleaned up, even on failure
         try:
             # Run replay synchronously (in production, consider background task)
             # Processes candles ONE AT A TIME through full pipeline
+            print(f"[REPLAY] Running replay engine...")
             result = replay_engine.run(db)
+            print(f"[REPLAY] Replay engine completed: {result['total_candles']} candles processed")
+            print(f"[REPLAY] CSV replay complete")
             
             # Fetch trades and equity curve for metrics computation
             trades = db.query(Trade).filter(
@@ -871,10 +941,10 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 "end_date": request.end_date,
                 "candles_processed": result["total_candles"],
                 "trades_executed": len(trades),
-                "win_rate": metrics_snapshot.core_metrics.win_rate,
+                "win_rate": metrics_snapshot.win_rate,
                 "net_pnl": net_pnl,
-                "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
-                "sharpe_proxy": metrics_snapshot.risk_adjusted.sharpe_proxy if metrics_snapshot.risk_adjusted.sharpe_proxy is not None else None,
+                "max_drawdown_pct": metrics_snapshot.max_drawdown_pct,
+                "sharpe_proxy": metrics_snapshot.sharpe_proxy if not (math.isnan(metrics_snapshot.sharpe_proxy) or math.isinf(metrics_snapshot.sharpe_proxy)) else None,
                 "stop_loss_pct": round(stop_loss_pct, 2)
             }
             
@@ -925,8 +995,8 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                         mismatches.append(f"trade_count: {prev.trade_count} vs {len(trades)}")
                     if abs(prev.final_equity - result["final_equity"]) > 0.01:  # Allow small floating point differences
                         mismatches.append(f"final_equity: {prev.final_equity:.2f} vs {result['final_equity']:.2f}")
-                    if abs(prev.max_drawdown_pct - metrics_snapshot.risk_metrics.max_drawdown_pct) > 0.01:
-                        mismatches.append(f"max_drawdown_pct: {prev.max_drawdown_pct:.2f}% vs {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+                    if abs(prev.max_drawdown_pct - metrics_snapshot.max_drawdown_pct) > 0.01:
+                        mismatches.append(f"max_drawdown_pct: {prev.max_drawdown_pct:.2f}% vs {metrics_snapshot.max_drawdown_pct:.2f}%")
                     
                     if mismatches:
                         # DETERMINISM VIOLATION: Raise clear error and log both results
@@ -950,7 +1020,7 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                         print(f"  Candle count: {result['total_candles']}")
                         print(f"  Trade count: {len(trades)}")
                         print(f"  Final equity: {result['final_equity']:.2f}")
-                        print(f"  Max drawdown: {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+                        print(f"  Max drawdown: {metrics_snapshot.max_drawdown_pct:.2f}%")
                         print(f"\nMismatches: {', '.join(mismatches)}")
                         print("=" * 60 + "\n")
                         
@@ -962,7 +1032,7 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                         determinism_message = "Deterministic replay confirmed"
                         print(f"\n[DETERMINISM VERIFIED] Replay {replay_id} matches previous replay {prev.replay_id}")
                         print(f"Replay Fingerprint: {replay_fingerprint}")
-                        print(f"All metrics match: candle_count={result['total_candles']}, trade_count={len(trades)}, final_equity={result['final_equity']:.2f}, max_drawdown={metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%\n")
+                        print(f"All metrics match: candle_count={result['total_candles']}, trade_count={len(trades)}, final_equity={result['final_equity']:.2f}, max_drawdown={metrics_snapshot.max_drawdown_pct:.2f}%\n")
                 else:
                     # No previous run to compare
                     determinism_status = "no_previous_run"
@@ -985,8 +1055,8 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             print(f"Trades executed: {len(trades)}")
             print(f"Final equity: ${result['final_equity']:,.2f}")
             print(f"Net P&L: ${net_pnl:,.2f}")
-            print(f"Max drawdown: {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
-            sharpe_display = f"{metrics_snapshot.risk_adjusted.sharpe_proxy:.2f}" if metrics_snapshot.risk_adjusted.sharpe_proxy is not None else "N/A"
+            print(f"Max drawdown: {metrics_snapshot.max_drawdown_pct:.2f}%")
+            sharpe_display = f"{metrics_snapshot.sharpe_proxy:.2f}" if not (math.isnan(metrics_snapshot.sharpe_proxy) or math.isinf(metrics_snapshot.sharpe_proxy)) else "N/A"
             print(f"Sharpe proxy: {sharpe_display}")
             print(f"Replay ID: {replay_id}")
             print("=" * 50 + "\n")
@@ -998,7 +1068,10 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
             print(f"  Candle count: {result['total_candles']}")
             print(f"  Trade count: {len(trades)}")
             print(f"  Final equity: {result['final_equity']:.2f}")
-            print(f"  Max drawdown: {metrics_snapshot.risk_metrics.max_drawdown_pct:.2f}%")
+            print(f"  Max drawdown: {metrics_snapshot.max_drawdown_pct:.2f}%")
+            
+            # PERSISTENCE GUARANTEE: Log before persistence
+            print(f"[REPLAY] Persisting replay summary for replay_id={replay_id}")
             
             # PERSIST REPLAY SUMMARY
             replay_summary = ReplaySummary(
@@ -1011,13 +1084,15 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 trade_count=len(trades),
                 final_equity=result["final_equity"],
                 net_pnl=net_pnl,
-                max_drawdown_pct=metrics_snapshot.risk_metrics.max_drawdown_pct,
-                max_drawdown_absolute=metrics_snapshot.risk_metrics.max_drawdown_absolute,
-                sharpe_proxy=metrics_snapshot.risk_adjusted.sharpe_proxy,
+                max_drawdown_pct=metrics_snapshot.max_drawdown_pct,
+                max_drawdown_absolute=metrics_snapshot.max_drawdown_absolute,
+                sharpe_proxy=metrics_snapshot.sharpe_proxy if not (math.isnan(metrics_snapshot.sharpe_proxy) or math.isinf(metrics_snapshot.sharpe_proxy)) else None,
                 timestamp_completed=datetime.now(timezone.utc)
             )
             db.add(replay_summary)
             db.commit()
+            
+            print(f"[REPLAY] Replay summary persisted successfully for replay_id={replay_id}")
             
             replay_running = False
             
@@ -1028,7 +1103,7 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
                 "total_candles": result["total_candles"],
                 "final_equity": result["final_equity"],
                 "trade_count": len(trades),
-                "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
+                "max_drawdown_pct": metrics_snapshot.max_drawdown_pct,
                 "source": source,
                 "determinism_status": determinism_status,
                 "determinism_message": determinism_message,
@@ -1039,19 +1114,271 @@ async def start_replay(request: ReplayRequest, db: Session = Depends(get_db)):
         
         except Exception as e:
             # MULTI-RUN SAFETY: Always reset replay_running flag on failure
+            error_msg = f"Replay execution failed: {str(e)}"
+            print(f"[REPLAY] ERROR: {error_msg}")
             replay_running = False
             # MULTI-RUN SAFETY: Reset replay engine state to prevent corruption
             replay_engine.reset()
-            raise
+            # REPLAY COMPLETION PATH: Always reach SUCCESS or FAILURE state
+            raise Exception(error_msg)
     
     except ValueError as e:
+        # REPLAY COMPLETION PATH: Explicit error returned (FAILURE state)
+        error_msg = str(e)
+        print(f"[REPLAY] ERROR (ValueError): {error_msg}")
         replay_running = False
         replay_engine.reset()  # MULTI-RUN SAFETY: Clean up state
-        return {"error": str(e)}, 400
+        return {"error": error_msg}, 400
     except Exception as e:
+        # REPLAY COMPLETION PATH: Explicit error returned (FAILURE state)
+        error_msg = f"Replay failed: {str(e)}"
+        print(f"[REPLAY] ERROR (Exception): {error_msg}")
         replay_running = False
         replay_engine.reset()  # MULTI-RUN SAFETY: Clean up state
-        return {"error": f"Replay failed: {str(e)}"}, 500
+        return {"error": error_msg}, 500
+
+
+@app.post("/replay/start_csv")
+async def start_replay_csv(request: ReplayCsvRequest, db: Session = Depends(get_db)):
+    """
+    Start a historical replay (backtest) using CSV file data.
+    
+    This endpoint loads OHLCV candles from a CSV file and runs a replay.
+    CSV format must have columns: date, open, high, low, close, volume
+    
+    Args:
+        request: ReplayCsvRequest with symbol and csv_path
+    
+    Returns:
+        Replay results with status, replay_id, trades, metrics, etc.
+    """
+    global replay_running
+    
+    # Safeguard: Prevent concurrent replay
+    if replay_running:
+        return {"error": "Replay already in progress"}, 400
+    
+    # Safeguard: Validate symbol
+    if request.symbol not in ALL_SYMBOLS:
+        return {"error": f"Symbol {request.symbol} not in allowed list"}, 400
+    
+    # Load candles from CSV
+    candles = None
+    source = "csv"
+    
+    try:
+        print(f"[REPLAY] Starting CSV replay for {request.symbol}")
+        print(f"[REPLAY] Loading candles from CSV: {request.csv_path}")
+        csv_candles = load_csv_candles(
+            csv_path=request.csv_path,
+            symbol=request.symbol
+        )
+        
+        # PREFLIGHT VALIDATION: Check if candle count == 0
+        if not csv_candles or len(csv_candles) == 0:
+            error_msg = f"No valid candles found in CSV file: {request.csv_path}"
+            print(f"[REPLAY] ERROR: {error_msg}")
+            return {"error": error_msg}, 400
+        
+        print(f"[REPLAY] Loaded {len(csv_candles)} candles from CSV")
+        
+        # Convert to replay format (Unix timestamps)
+        candles = csv_convert_to_replay_format(csv_candles)
+        source = "csv"
+        
+        # PREFLIGHT VALIDATION: Check candle count after conversion
+        if not candles or len(candles) == 0:
+            error_msg = f"No valid candles after conversion for {request.symbol}"
+            print(f"[REPLAY] ERROR: {error_msg}")
+            return {"error": error_msg}, 400
+        
+        print(f"[REPLAY] Converted to replay format: {len(candles)} candles")
+        
+    except FileNotFoundError as e:
+        error_msg = f"CSV file not found: {request.csv_path}"
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 400
+    except ValueError as e:
+        error_msg = str(e)
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 400
+    except Exception as e:
+        error_msg = f"Failed to load CSV file: {str(e)}"
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 500
+    
+    # GUARDRAILS: Validate candles meet minimum thresholds
+    MIN_CANDLES_FOR_REPLAY_DAILY = 50  # Minimum for daily data (about 2.5 months)
+    MIN_CANDLES_FOR_INDICATORS = 50  # Minimum for EMA(50)
+    
+    # CSV data is assumed to be daily
+    MIN_CANDLES_FOR_REPLAY = MIN_CANDLES_FOR_REPLAY_DAILY
+    
+    # PREFLIGHT VALIDATION: Check if candle count == 0 (must be explicit, no silent exit)
+    if not candles or len(candles) == 0:
+        error_msg = f"No candles provided for replay"
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 400
+    
+    print(f"[REPLAY] Preflight validation: {len(candles)} candles, minimum required: {MIN_CANDLES_FOR_INDICATORS} for indicators, {MIN_CANDLES_FOR_REPLAY} for replay")
+    
+    if len(candles) < MIN_CANDLES_FOR_INDICATORS:
+        error_msg = f"Need at least {MIN_CANDLES_FOR_INDICATORS} candles for replay (EMA(50) requires {MIN_CANDLES_FOR_INDICATORS} candles). Got {len(candles)}"
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {"error": error_msg}, 400
+    
+    if len(candles) < MIN_CANDLES_FOR_REPLAY:
+        error_msg = f"Insufficient candles for meaningful evaluation. Got {len(candles)}, minimum {MIN_CANDLES_FOR_REPLAY} required."
+        print(f"[REPLAY] ERROR: {error_msg}")
+        return {
+            "error": error_msg,
+            "warning": f"Replay with fewer than {MIN_CANDLES_FOR_REPLAY} candles may not provide reliable performance metrics"
+        }, 400
+    
+    print(f"[REPLAY] Preflight validation PASSED: {len(candles)} candles ready for replay")
+    
+    # Extract date range from candles for summary
+    first_candle_time = datetime.fromtimestamp(candles[0]["time"], tz=timezone.utc)
+    last_candle_time = datetime.fromtimestamp(candles[-1]["time"], tz=timezone.utc)
+    start_date = first_candle_time.strftime("%Y-%m-%d")
+    end_date = last_candle_time.strftime("%Y-%m-%d")
+    
+    try:
+        print(f"[REPLAY] Starting CSV replay for {request.symbol} with {len(candles)} candles")
+        replay_id = replay_engine.start_replay(
+            symbol=request.symbol,
+            candles=candles,
+            replay_id=request.replay_id,
+            source=source
+        )
+        
+        print(f"[REPLAY] Replay started with replay_id={replay_id}")
+        replay_running = True
+        
+        # MULTI-RUN SAFETY: Ensure replay state is always cleaned up, even on failure
+        try:
+            # Run replay synchronously (in production, consider background task)
+            # Processes candles ONE AT A TIME through full pipeline
+            print(f"[REPLAY] Running replay engine...")
+            result = replay_engine.run(db)
+            print(f"[REPLAY] Replay engine completed: {result['total_candles']} candles processed")
+            print(f"[REPLAY] CSV replay complete")
+            
+            # Fetch trades and equity curve for metrics computation
+            trades = db.query(Trade).filter(
+                Trade.replay_id == replay_id
+            ).order_by(Trade.entry_time).all()
+            
+            equity_curve = db.query(EquityCurve).filter(
+                EquityCurve.replay_id == replay_id
+            ).order_by(EquityCurve.timestamp).all()
+            
+            # Compute metrics for determinism verification and summary
+            metrics_snapshot = compute_metrics(trades, equity_curve)
+            
+            # Calculate net P&L (final_equity - initial_equity)
+            initial_equity = replay_engine.initial_equity
+            net_pnl = result["final_equity"] - initial_equity
+            
+            # Generate performance report
+            closed_trades = [t for t in trades if t.exit_time is not None]
+            stop_loss_trades = [t for t in closed_trades if t.reason and "STOP_LOSS" in t.reason.upper()]
+            stop_loss_pct = (len(stop_loss_trades) / len(closed_trades) * 100) if len(closed_trades) > 0 else 0.0
+            
+            replay_report = {
+                "symbol": request.symbol,
+                "csv_path": request.csv_path,
+                "start_date": start_date,
+                "end_date": end_date,
+                "candles_processed": result["total_candles"],
+                "trades_executed": len(trades),
+                "win_rate": metrics_snapshot.win_rate,
+                "net_pnl": net_pnl,
+                "max_drawdown_pct": metrics_snapshot.max_drawdown_pct,
+                "sharpe_proxy": metrics_snapshot.sharpe_proxy if not (math.isnan(metrics_snapshot.sharpe_proxy) or math.isinf(metrics_snapshot.sharpe_proxy)) else None,
+                "stop_loss_pct": round(stop_loss_pct, 2)
+            }
+            
+            # Print performance report to console
+            print("\n" + "=" * 60)
+            print("HISTORICAL REPLAY RESULTS (CSV Data)")
+            print("=" * 60)
+            print(f"Symbol: {replay_report['symbol']}")
+            print(f"CSV File: {replay_report['csv_path']}")
+            print(f"Date Range: {replay_report['start_date']} → {replay_report['end_date']}")
+            print(f"Candles Processed: {replay_report['candles_processed']:,}")
+            print(f"Trades Executed: {replay_report['trades_executed']}")
+            print(f"Win Rate: {replay_report['win_rate']:.2f}%")
+            print(f"Net P&L: ${replay_report['net_pnl']:,.2f}")
+            print(f"Max Drawdown: {replay_report['max_drawdown_pct']:.2f}%")
+            sharpe_display = f"{replay_report['sharpe_proxy']:.2f}" if replay_report['sharpe_proxy'] is not None else "N/A"
+            print(f"Sharpe Proxy: {sharpe_display}")
+            print(f"Stop-Loss Exits: {replay_report['stop_loss_pct']:.2f}% of trades")
+            print("=" * 60 + "\n")
+            
+            # PERSISTENCE GUARANTEE: Log before persistence
+            print(f"[REPLAY] Persisting replay summary for replay_id={replay_id}")
+            
+            # PERSIST REPLAY SUMMARY
+            replay_summary = ReplaySummary(
+                replay_id=replay_id,
+                symbol=request.symbol,
+                start_date=start_date,
+                end_date=end_date,
+                source=source,
+                candle_count=result["total_candles"],
+                trade_count=len(trades),
+                final_equity=result["final_equity"],
+                net_pnl=net_pnl,
+                max_drawdown_pct=metrics_snapshot.max_drawdown_pct,
+                max_drawdown_absolute=metrics_snapshot.max_drawdown_absolute,
+                sharpe_proxy=metrics_snapshot.sharpe_proxy if not (math.isnan(metrics_snapshot.sharpe_proxy) or math.isinf(metrics_snapshot.sharpe_proxy)) else None,
+                timestamp_completed=datetime.now(timezone.utc)
+            )
+            db.add(replay_summary)
+            db.commit()
+            
+            print(f"[REPLAY] Replay summary persisted successfully for replay_id={replay_id}")
+            
+            replay_running = False
+            
+            return {
+                "status": "completed",
+                "replay_id": replay_id,
+                "symbol": request.symbol,
+                "csv_path": request.csv_path,
+                "total_candles": result["total_candles"],
+                "final_equity": result["final_equity"],
+                "trade_count": len(trades),
+                "max_drawdown_pct": metrics_snapshot.max_drawdown_pct,
+                "source": source,
+                "report": replay_report
+            }
+        
+        except Exception as e:
+            # MULTI-RUN SAFETY: Always reset replay_running flag on failure
+            error_msg = f"Replay execution failed: {str(e)}"
+            print(f"[REPLAY] ERROR: {error_msg}")
+            replay_running = False
+            # MULTI-RUN SAFETY: Reset replay engine state to prevent corruption
+            replay_engine.reset()
+            # REPLAY COMPLETION PATH: Always reach SUCCESS or FAILURE state
+            raise Exception(error_msg)
+    
+    except ValueError as e:
+        # REPLAY COMPLETION PATH: Explicit error returned (FAILURE state)
+        error_msg = str(e)
+        print(f"[REPLAY] ERROR (ValueError): {error_msg}")
+        replay_running = False
+        replay_engine.reset()  # MULTI-RUN SAFETY: Clean up state
+        return {"error": error_msg}, 400
+    except Exception as e:
+        # REPLAY COMPLETION PATH: Explicit error returned (FAILURE state)
+        error_msg = f"Replay failed: {str(e)}"
+        print(f"[REPLAY] ERROR (Exception): {error_msg}")
+        replay_running = False
+        replay_engine.reset()  # MULTI-RUN SAFETY: Clean up state
+        return {"error": error_msg}, 500
 
 
 @app.get("/replay/status")
@@ -1113,10 +1440,10 @@ async def get_replay_results(replay_id: str, db: Session = Depends(get_db)):
         "end_date": summary.end_date if summary else None,
         "candles_processed": summary.candle_count if summary else 0,
         "trades_executed": len(trades),
-        "win_rate": metrics_snapshot.core_metrics.win_rate,
+        "win_rate": metrics_snapshot.win_rate,
         "net_pnl": net_pnl,
-        "max_drawdown_pct": metrics_snapshot.risk_metrics.max_drawdown_pct,
-        "sharpe_proxy": metrics_snapshot.risk_adjusted.sharpe_proxy if metrics_snapshot.risk_adjusted.sharpe_proxy is not None else None,
+        "max_drawdown_pct": metrics_snapshot.max_drawdown_pct,
+        "sharpe_proxy": metrics_snapshot.sharpe_proxy if not (math.isnan(metrics_snapshot.sharpe_proxy) or math.isinf(metrics_snapshot.sharpe_proxy)) else None,
         "stop_loss_pct": round(stop_loss_pct, 2)
     }
     
@@ -1188,12 +1515,17 @@ class YahooFetchRequest(BaseModel):
 @app.post("/data/yahoo/fetch")
 async def fetch_yahoo_data(request: YahooFetchRequest):
     """
-    Fetch historical 5-minute candles from Yahoo Finance.
+    Fetch historical daily candles from Yahoo Finance.
+    
+    Note: Daily candles (1d interval) are used as the default because Yahoo Finance
+    has limitations on intraday data availability. For historical backtesting,
+    daily candles provide sufficient granularity and better data quality.
     
     Safeguards:
     - Validates symbol is in approved universe (Nasdaq-100, Dow-30)
     - Limits date range to 1 year maximum
     - Returns normalized candles ready for replay
+    - Rejects intraday interval requests with clear error message
     
     Args:
         request: YahooFetchRequest with symbol, start_date, end_date

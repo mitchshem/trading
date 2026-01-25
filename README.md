@@ -37,10 +37,22 @@ A scoped MVP for a paper-trading system that mirrors a small subset of TradingVi
 Open Terminal 1:
 ```bash
 cd backend
+
+# Create virtual environment (if it doesn't exist)
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Activate virtual environment
+# On macOS/Linux:
+source venv/bin/activate
+# On Windows:
+# venv\Scripts\activate
+
+# Install dependencies (first time only, or after requirements.txt changes)
 pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Start the backend server
+# Note: Using 'python -m uvicorn' ensures uvicorn runs from the activated venv
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 You should see:

@@ -1,6 +1,10 @@
 """
 Yahoo Finance historical market data provider.
-Fetches 5-minute OHLCV candles for replay/backtesting.
+Fetches daily OHLCV candles for replay/backtesting.
+
+Note: Daily candles are used as the default because Yahoo Finance has limitations
+on intraday data availability and reliability. For historical backtesting, daily
+candles provide sufficient granularity and better data quality.
 """
 
 from typing import List, Dict, Optional
@@ -13,22 +17,33 @@ from utils import ensure_utc_datetime
 def fetch_yahoo_candles(
     symbol: str,
     start_date: str,
-    end_date: str
+    end_date: str,
+    interval: str = "1d"
 ) -> List[Dict]:
     """
-    Fetch historical 5-minute candles from Yahoo Finance.
+    Fetch historical daily candles from Yahoo Finance.
     
     Args:
-        symbol: Trading symbol (e.g., "AAPL")
-        start_date: Start date in "YYYY-MM-DD" format
-        end_date: End date in "YYYY-MM-DD" format (exclusive)
+        symbol: Trading symbol (e.g., "AAPL", "SPY")
+        start_date: Start date in "YYYY-MM-DD" format (inclusive)
+        end_date: End date in "YYYY-MM-DD" format (inclusive - yfinance end is exclusive, so we add 1 day)
+        interval: Data interval (default: "1d" for daily candles)
+                  Note: Intraday intervals (e.g., "5m", "1h") are not supported
+                  due to Yahoo Finance limitations. Use "1d" for reliable backtesting.
     
     Returns:
         List of candle dicts with keys: timestamp, open, high, low, close, volume
     
     Raises:
-        ValueError: If no data is returned or validation fails
+        ValueError: If no data is returned, validation fails, or intraday interval is requested
     """
+    # Validate interval: Only daily candles are supported
+    if interval != "1d":
+        raise ValueError(
+            f"Intraday intervals are not supported due to Yahoo Finance limitations. "
+            f"Requested interval: {interval}. Use '1d' for daily candles instead."
+        )
+    
     # Parse dates
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -36,27 +51,46 @@ def fetch_yahoo_candles(
     except ValueError as e:
         raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
     
+    # CRITICAL: yfinance end_date is EXCLUSIVE, so add 1 day to make it inclusive
+    # This ensures we get data for the end_date itself
+    end_dt_inclusive = end_dt + timedelta(days=1)
+    
+    # Log fetch attempt
+    print(f"[YAHOO FINANCE] Fetching DAILY candles for {symbol}")
+    print(f"[YAHOO FINANCE]   Start date: {start_date} (inclusive)")
+    print(f"[YAHOO FINANCE]   End date: {end_date} (inclusive, yfinance end={end_dt_inclusive.date()})")
+    
     # Fetch data from Yahoo Finance
     ticker = yf.Ticker(symbol)
     
-    # Request 5-minute candles, unadjusted
+    # Request daily candles, unadjusted
     df = ticker.history(
         start=start_dt,
-        end=end_dt,
-        interval="5m",
+        end=end_dt_inclusive,  # yfinance end is exclusive, so we add 1 day
+        interval="1d",  # Daily candles (default and only supported interval)
         auto_adjust=False,
         prepost=False
     )
     
+    # Log raw DataFrame info
+    print(f"[YAHOO FINANCE]   Raw DataFrame rows returned: {len(df)}")
+    
     # Check if data is empty
     if df.empty:
-        raise ValueError(f"No data returned from Yahoo Finance for {symbol} between {start_date} and {end_date}")
+        error_msg = f"No DAILY data returned from Yahoo Finance for {symbol} between {start_date} and {end_date}"
+        print(f"[YAHOO FINANCE] ERROR: {error_msg}")
+        raise ValueError(error_msg)
     
     # Normalize to canonical format
     candles = normalize_yahoo_candles(df, symbol)
     
+    # Log normalized candle count
+    print(f"[YAHOO FINANCE]   Valid candles after normalization: {len(candles)}")
+    
     # Validate candles
     validate_candles(candles, symbol)
+    
+    print(f"[YAHOO FINANCE] SUCCESS: Fetched {len(candles)} daily candles for {symbol}")
     
     return candles
 
@@ -82,7 +116,7 @@ def normalize_yahoo_candles(df: pd.DataFrame, symbol: str) -> List[Dict]:
             # Convert to UTC timezone-aware datetime
             if idx.tz is None:
                 # yfinance typically returns timezone-naive timestamps
-                # For 5-minute data, we treat as UTC (yfinance may return UTC-naive)
+                # For daily data, we treat as UTC (yfinance may return UTC-naive)
                 # This ensures canonical UTC representation
                 timestamp = idx.replace(tzinfo=timezone.utc)
             else:
@@ -125,7 +159,10 @@ def validate_candles(candles: List[Dict], symbol: str):
     Validate candles meet requirements:
     - Strictly ordered by timestamp ascending
     - No missing OHLCV values (already filtered in normalize)
-    - Regular 5-minute spacing (skip gaps, don't forward-fill)
+    - Valid OHLC relationships (low <= open/close <= high)
+    
+    Note: For daily candles, we don't enforce exact spacing because markets have
+    weekends and holidays, so gaps between trading days are expected.
     
     Args:
         candles: List of candle dicts
@@ -152,13 +189,10 @@ def validate_candles(candles: List[Dict], symbol: str):
                 f"Index {i-1}: {prev_timestamp}, Index {i}: {curr_timestamp}"
             )
     
-    # Check 5-minute spacing (allow some tolerance for market hours gaps)
-    # We don't enforce exact 5-minute spacing because markets have:
-    # - Pre-market hours
-    # - Regular trading hours
-    # - After-hours
-    # - Weekends/holidays
-    # So we just ensure they're ordered and valid
+    # Note: For daily candles, we don't enforce exact spacing because:
+    # - Markets have weekends (no trading Saturday/Sunday)
+    # - Markets have holidays (no trading on certain days)
+    # - We only ensure they're ordered and valid
     
     # Validate OHLCV values are valid numbers
     for i, candle in enumerate(candles):
