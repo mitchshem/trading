@@ -5,6 +5,7 @@ Deterministic, rule-based strategies only.
 
 from typing import List, Dict, Optional, Literal
 from indicators import ema, atr
+from utils import fmt
 
 
 SignalType = Literal["BUY", "EXIT", "HOLD"]
@@ -73,7 +74,7 @@ def ema_trend_v1(
         if current_close < current_ema50:
             return {
                 "signal": "EXIT",
-                "reason": f"Close {current_close:.2f} below EMA(50) {current_ema50:.2f}"
+                "reason": f"Close {fmt(current_close)} below EMA(50) {fmt(current_ema50)}"
             }
         
         # Exit condition 2: Stop loss (price <= entry_price - 2*ATR)
@@ -82,7 +83,7 @@ def ema_trend_v1(
             if current_close <= stop_loss_price:
                 return {
                     "signal": "EXIT",
-                    "reason": f"Stop loss triggered: {current_close:.2f} <= {stop_loss_price:.2f}"
+                    "reason": f"Stop loss triggered: {fmt(current_close)} <= {fmt(stop_loss_price)}"
                 }
     
     # ENTRY conditions (only if no position)
@@ -96,7 +97,7 @@ def ema_trend_v1(
         if ema_cross_above and close_above_ema50:
             return {
                 "signal": "BUY",
-                "reason": f"EMA(20) crossed above EMA(50), close {current_close:.2f} > EMA(50) {current_ema50:.2f}"
+                "reason": f"EMA(20) crossed above EMA(50), close {fmt(current_close)} > EMA(50) {fmt(current_ema50)}"
             }
     
     return {"signal": "HOLD", "reason": "No signal conditions met"}

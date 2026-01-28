@@ -11,6 +11,7 @@ from database import Signal, Trade, EquityCurve
 from indicators import ema, atr
 from strategy import ema_trend_v1, PositionState
 from paper_broker import PaperBroker
+from regime_classifier import classify_regime
 from utils import ensure_utc_datetime, unix_to_utc_datetime
 
 
@@ -32,6 +33,7 @@ class ReplayEngine:
         self.status = "idle"  # idle, running, completed, error
         self.error_message: Optional[str] = None
         self.source: Optional[str] = None  # Data source (e.g., "yahoo_finance")
+        self.allowed_entry_regimes: Optional[List[str]] = None  # Optional regime gate for entries
     
     def reset(self):
         """Reset all state for a new replay."""
@@ -43,13 +45,15 @@ class ReplayEngine:
         self.status = "idle"
         self.error_message = None
         self.source = None
+        self.allowed_entry_regimes = None
     
     def start_replay(
         self,
         symbol: str,
         candles: List[Dict],
         replay_id: Optional[str] = None,
-        source: Optional[str] = None
+        source: Optional[str] = None,
+        allowed_entry_regimes: Optional[List[str]] = None
     ) -> str:
         """
         Start a new replay.
@@ -88,10 +92,12 @@ class ReplayEngine:
         self.total_candles = len(candles)
         self.status = "running"
         self.source = source or "unknown"  # Log data source
+        self.allowed_entry_regimes = allowed_entry_regimes  # Optional regime gate
         
-        # Log source for tracking
+        # Log source and regime gate for tracking
         if source:
-            print(f"Replay {replay_id} started with source: {source}, symbol: {symbol}, candles: {len(candles)}")
+            regime_gate_info = f", regime_gate: {allowed_entry_regimes}" if allowed_entry_regimes else ""
+            print(f"Replay {replay_id} started with source: {source}, symbol: {symbol}, candles: {len(candles)}{regime_gate_info}")
         
         return replay_id
     
@@ -224,7 +230,20 @@ class ReplayEngine:
         trade_executed = None
         kill_switch_triggered = False
         
-        if result["signal"] == "BUY" and current_atr is not None and self.symbol not in stop_loss_symbols:
+        # REGIME GATE: Check if BUY signal is allowed based on current regime
+        buy_allowed = True
+        if result["signal"] == "BUY" and self.allowed_entry_regimes:
+            # Classify current regime (need at least 200 candles for EMA(200))
+            current_regime = classify_regime(self.candle_history, self.current_candle_index - 1)
+            if current_regime is None:
+                # Not enough candles to classify regime yet - allow trade (default behavior)
+                buy_allowed = True
+            elif current_regime not in self.allowed_entry_regimes:
+                buy_allowed = False
+                # Log regime gate blocking
+                print(f"[REGIME GATE] BUY signal blocked: current regime {current_regime} not in allowed {self.allowed_entry_regimes}")
+        
+        if result["signal"] == "BUY" and current_atr is not None and self.symbol not in stop_loss_symbols and buy_allowed:
             # Calculate stop distance (2 * ATR)
             stop_distance = 2 * current_atr
             

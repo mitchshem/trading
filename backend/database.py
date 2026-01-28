@@ -134,6 +134,7 @@ class ReplaySummary(Base):
     max_drawdown_pct = Column(Float, nullable=False)
     max_drawdown_absolute = Column(Float, nullable=False)
     sharpe_proxy = Column(Float, nullable=True)  # Risk-adjusted metric
+    allowed_entry_regimes = Column(String, nullable=True)  # JSON string of allowed regimes, e.g. '["TREND_UP"]' or None for all
     # FIX 1: CANONICAL TIME HANDLING - UTC timezone-aware datetime only
     timestamp_completed = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
@@ -152,6 +153,7 @@ class ReplaySummary(Base):
             "max_drawdown_pct": self.max_drawdown_pct,
             "max_drawdown_absolute": self.max_drawdown_absolute,
             "sharpe_proxy": self.sharpe_proxy,
+            "allowed_entry_regimes": self.allowed_entry_regimes,  # JSON string or None - shows which regimes were allowed for entries
             "timestamp_completed": self.timestamp_completed.isoformat() if self.timestamp_completed else None
         }
 

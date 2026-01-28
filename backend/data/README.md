@@ -27,13 +27,15 @@ Use the `POST /replay/start_csv` endpoint to run a replay with CSV data:
 ```json
 {
   "symbol": "AAPL",
-  "csv_path": "data/AAPL_daily.csv"
+  "csv_path": "data d/AAPL_daily.csv"
 }
 ```
 
 The CSV path can be:
-- Relative to the `backend/` directory (e.g., `"data/AAPL_daily.csv"`)
-- Absolute path (e.g., `"/path/to/data/AAPL_daily.csv"`)
+- Relative to the `backend/` directory (e.g., `"../data d/AAPL_daily.csv"`)
+- Absolute path (e.g., `"/path/to/data d/AAPL_daily.csv"`)
+
+**Note:** Daily CSV files are located in the `data d/` folder. For 5-minute candles, use the `data 5/` folder.
 
 ## Sample Files
 
@@ -43,8 +45,14 @@ The CSV path can be:
 ## Data Sources
 
 - **Raw data**: Stored in `../../raw_data/` (untouched source files)
-- **Normalized CSV files**: Stored here for replay execution
-- Files in this directory are ready for direct use by the replay system
+- **Daily CSV files**: Stored in `../../data d/` folder (for daily replays)
+- **5-minute CSV files**: Stored in `../../data 5/` folder (for intraday replays)
+- Files in these directories are ready for direct use by the replay system
+
+## Folder Structure
+
+- `data d/`: Contains daily OHLCV CSV files
+- `data 5/`: Contains 5-minute OHLCV CSV files
 
 ## Notes
 

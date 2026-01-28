@@ -91,12 +91,17 @@ def load_csv_candles(csv_path: str, symbol: str = None) -> List[Dict]:
                         raise ValueError(f"Could not parse date: {date_str}")
                     
                     # Convert to UTC timezone-aware datetime
-                    # Assume dates are in market timezone (EST/EDT), convert to UTC
-                    # For daily data, we set time to 00:00:00 UTC
-                    timestamp = date_parsed.replace(
-                        hour=0, minute=0, second=0, microsecond=0,
-                        tzinfo=timezone.utc
-                    )
+                    # For daily data: set time to 00:00:00 UTC
+                    # For intraday data: preserve the time component
+                    if date_parsed.hour == 0 and date_parsed.minute == 0 and date_parsed.second == 0:
+                        # Daily data - normalize to midnight UTC
+                        timestamp = date_parsed.replace(
+                            hour=0, minute=0, second=0, microsecond=0,
+                            tzinfo=timezone.utc
+                        )
+                    else:
+                        # Intraday data - preserve time component, assume UTC
+                        timestamp = date_parsed.replace(tzinfo=timezone.utc)
                     timestamp = ensure_utc_datetime(timestamp, f"CSV row {row_count} for {symbol_display}")
                     
                     # Parse OHLCV values
