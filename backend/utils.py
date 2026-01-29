@@ -4,7 +4,8 @@ Enforces canonical UTC timezone-aware datetime representation.
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
+import math
 
 
 def ensure_utc_datetime(dt: datetime, context: str = "") -> datetime:
@@ -71,3 +72,84 @@ def utc_datetime_to_unix(dt: datetime) -> int:
     """
     ensure_utc_datetime(dt, "utc_datetime_to_unix")
     return int(dt.timestamp())
+
+
+def fmt(value: Union[int, float, None, str], decimals: int = 2) -> str:
+    """
+    Safely format a numeric value for display.
+    
+    Prevents crashes when values are None, strings, or missing.
+    
+    Args:
+        value: Numeric value to format (int, float, None, or str)
+        decimals: Number of decimal places (default: 2)
+    
+    Returns:
+        Formatted string or "N/A" if value cannot be formatted
+    """
+    if value is None:
+        return "N/A"
+    
+    if isinstance(value, str):
+        return value
+    
+    if isinstance(value, (int, float)):
+        if math.isnan(value) or math.isinf(value):
+            return "N/A"
+        return f"{value:.{decimals}f}"
+    
+    return "N/A"
+
+
+def fmt_pct(value: Union[int, float, None, str], decimals: int = 2) -> str:
+    """
+    Safely format a percentage value for display.
+    
+    Prevents crashes when values are None, strings, or missing.
+    
+    Args:
+        value: Numeric value to format as percentage (int, float, None, or str)
+        decimals: Number of decimal places (default: 2)
+    
+    Returns:
+        Formatted percentage string or "N/A" if value cannot be formatted
+    """
+    if value is None:
+        return "N/A"
+    
+    if isinstance(value, str):
+        return value
+    
+    if isinstance(value, (int, float)):
+        if math.isnan(value) or math.isinf(value):
+            return "N/A"
+        return f"{value:.{decimals}f}%"
+    
+    return "N/A"
+
+
+def fmt_currency(value: Union[int, float, None, str], decimals: int = 2) -> str:
+    """
+    Safely format a currency value for display.
+    
+    Prevents crashes when values are None, strings, or missing.
+    
+    Args:
+        value: Numeric value to format as currency (int, float, None, or str)
+        decimals: Number of decimal places (default: 2)
+    
+    Returns:
+        Formatted currency string with $ prefix or "N/A" if value cannot be formatted
+    """
+    if value is None:
+        return "N/A"
+    
+    if isinstance(value, str):
+        return value
+    
+    if isinstance(value, (int, float)):
+        if math.isnan(value) or math.isinf(value):
+            return "N/A"
+        return f"${value:,.{decimals}f}"
+    
+    return "N/A"

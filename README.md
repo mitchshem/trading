@@ -37,10 +37,22 @@ A scoped MVP for a paper-trading system that mirrors a small subset of TradingVi
 Open Terminal 1:
 ```bash
 cd backend
+
+# Create virtual environment (if it doesn't exist)
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Activate virtual environment
+# On macOS/Linux:
+source venv/bin/activate
+# On Windows:
+# venv\Scripts\activate
+
+# Install dependencies (first time only, or after requirements.txt changes)
 pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Start the backend server
+# Note: Using 'python -m uvicorn' ensures uvicorn runs from the activated venv
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 You should see:
@@ -104,6 +116,8 @@ This starts both backend and frontend. Press `Ctrl+C` to stop.
 2. **GET /candles?symbol=XXX&limit=500** - Returns synthetic historical candle data
 3. **GET /signals?symbol=XXX&limit=100** - Returns trading signals for a symbol
 4. **WebSocket /ws** - Streams synthetic candle updates every 5 seconds and evaluates strategy on candle close
+5. **POST /replay/start_intraday_csv** - Run intraday replay with risk-based sizing
+6. **POST /replay/walkforward_intraday** - Walk-forward evaluation across multiple time windows
 
 ### Backend Modules
 
@@ -182,6 +196,67 @@ The SQLite database (`trading_signals.db`) contains a `signals` table with:
 - Trade execution and position management
 - Global kill-switch and max daily loss guardrails
 - Additional indicators (SMA, RSI, etc.)
+
+## Walk-Forward Evaluation
+
+The system supports walk-forward evaluation to prevent overfitting and measure out-of-sample performance. This evaluates strategy performance across separate train/test periods.
+
+### Example: Single Symbol Walk-Forward
+
+```bash
+curl -X POST http://localhost:8000/replay/walkforward_intraday \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbols": ["AAAU"],
+    "interval": "5min",
+    "exit_mode": "mfe_trailing",
+    "exit_params": {"mfe_retrace_pct": 50},
+    "allowed_sessions": ["market_open", "power_hour"],
+    "starting_equity": 100000,
+    "risk_per_trade_pct": 0.25,
+    "max_daily_loss_pct": 1.0,
+    "max_concurrent_positions": 1,
+    "windows": [
+      {"label": "train_1", "start_date": "2024-01-01", "end_date": "2024-06-30"},
+      {"label": "test_1", "start_date": "2024-07-01", "end_date": "2024-12-31"}
+    ]
+  }'
+```
+
+### Example: Multi-Symbol Walk-Forward
+
+```bash
+curl -X POST http://localhost:8000/replay/walkforward_intraday \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbols": ["AAAU", "SPY", "QQQ"],
+    "interval": "5min",
+    "exit_mode": "momentum_reversal",
+    "allowed_sessions": ["market_open"],
+    "starting_equity": 100000,
+    "risk_per_trade_pct": 0.25,
+    "windows": [
+      {"label": "train_1", "start_date": "2024-01-01", "end_date": "2024-06-30"},
+      {"label": "test_1", "start_date": "2024-07-01", "end_date": "2024-12-31"}
+    ]
+  }'
+```
+
+### Response Structure
+
+The walk-forward endpoint returns:
+- **windows**: Array of window results with metrics per window
+- **aggregate_comparison**: Train vs test comparison (return delta, drawdown delta)
+- **robustness**: % of windows with positive return, worst test drawdown
+
+Each window includes:
+- `trades_executed`
+- `return_on_capital_pct`
+- `max_portfolio_drawdown_pct`
+- `expectancy`
+- `win_rate`
+- `average_trades_per_day`
+- `daily_pnl_distribution` (mean, std, worst_day)
 
 ## Notes
 
