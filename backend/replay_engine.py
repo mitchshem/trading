@@ -147,7 +147,6 @@ class ReplayEngine:
             candles=current_history,
             ema20_values=ema20_values,
             ema50_values=ema50_values,
-            atr14_values=atr14_values,
             position_state=self.position_state
         )
         

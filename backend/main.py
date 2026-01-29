@@ -437,7 +437,6 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
         candles=candles,
         ema20_values=ema20_values,
         ema50_values=ema50_values,
-        atr14_values=atr14_values,
         position_state=position_state
     )
     
