@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import csv
 import os
-from utils import ensure_utc_datetime
+from utils import ensure_utc_datetime, calculate_candle_timestamps
 
 
 def find_data_file(symbol: str, data_type: str = "daily") -> Optional[Path]:
@@ -185,7 +185,8 @@ def load_stooq_file(file_path: Path, symbol: str = None) -> List[Dict]:
                         date_parsed = date_parsed.replace(hour=hour, minute=minute, second=second)
                     
                     # Convert to UTC timezone-aware datetime
-                    if date_parsed.hour == 0 and date_parsed.minute == 0 and date_parsed.second == 0:
+                    is_daily = date_parsed.hour == 0 and date_parsed.minute == 0 and date_parsed.second == 0
+                    if is_daily:
                         # Daily data - normalize to midnight UTC
                         timestamp = date_parsed.replace(
                             hour=0, minute=0, second=0, microsecond=0,
@@ -195,6 +196,9 @@ def load_stooq_file(file_path: Path, symbol: str = None) -> List[Dict]:
                         # Intraday data - preserve time component, assume UTC
                         timestamp = date_parsed.replace(tzinfo=timezone.utc)
                     timestamp = ensure_utc_datetime(timestamp, f"Stooq row {row_count} for {symbol_display}")
+                    
+                    # Calculate open_time and close_time
+                    open_time, close_time = calculate_candle_timestamps(timestamp, is_daily=is_daily)
                     
                     # Parse OHLCV values
                     open_price = float(row.get('<OPEN>', 0))
@@ -221,9 +225,11 @@ def load_stooq_file(file_path: Path, symbol: str = None) -> List[Dict]:
                             f"low={low_price}, close={close_price}, high={high_price}"
                         )
                     
-                    # Create normalized candle
+                    # Create normalized candle with explicit open_time and close_time
                     candle = {
-                        "timestamp": timestamp,
+                        "timestamp": timestamp,  # Keep for backward compatibility
+                        "open_time": open_time,
+                        "close_time": close_time,
                         "open": open_price,
                         "high": high_price,
                         "low": low_price,

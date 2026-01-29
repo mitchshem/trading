@@ -3,7 +3,7 @@ Utility functions for time handling and validation.
 Enforces canonical UTC timezone-aware datetime representation.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Union
 import math
 
@@ -153,3 +153,40 @@ def fmt_currency(value: Union[int, float, None, str], decimals: int = 2) -> str:
         return f"${value:,.{decimals}f}"
     
     return "N/A"
+
+
+def calculate_candle_timestamps(base_timestamp: datetime, is_daily: bool = True) -> tuple[datetime, datetime]:
+    """
+    Calculate open_time and close_time for a candle.
+    
+    For daily candles:
+    - open_time: Market open (09:30 ET = 13:30 UTC)
+    - close_time: Market close (16:00 ET = 20:00 UTC)
+    
+    For intraday candles:
+    - open_time: Base timestamp (candle start)
+    - close_time: Base timestamp + interval duration
+    
+    Args:
+        base_timestamp: Base timestamp (date for daily, start time for intraday)
+        is_daily: True for daily candles, False for intraday
+    
+    Returns:
+        Tuple of (open_time, close_time) as UTC timezone-aware datetimes
+    """
+    base_timestamp = ensure_utc_datetime(base_timestamp, "calculate_candle_timestamps")
+    
+    if is_daily:
+        # Daily candle: use market hours
+        # Market open: 09:30 ET = 13:30 UTC
+        # Market close: 16:00 ET = 20:00 UTC
+        open_time = base_timestamp.replace(hour=13, minute=30, second=0, microsecond=0)
+        close_time = base_timestamp.replace(hour=20, minute=0, second=0, microsecond=0)
+    else:
+        # Intraday candle: assume 5-minute interval
+        # open_time = base timestamp
+        # close_time = base timestamp + 5 minutes
+        open_time = base_timestamp.replace(second=0, microsecond=0)
+        close_time = open_time + timedelta(minutes=5)
+    
+    return (open_time, close_time)

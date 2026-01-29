@@ -21,8 +21,11 @@ class ReplayEngine:
     Uses the same components as live trading for identical behavior.
     """
     
-    def __init__(self, initial_equity: float = 100000.0):
+    def __init__(self, initial_equity: float = 100000.0, commission_per_share: float = 0.0, commission_per_trade: float = 0.0, slippage: float = 0.0002):
         self.initial_equity = initial_equity
+        self.commission_per_share = commission_per_share
+        self.commission_per_trade = commission_per_trade
+        self.slippage = slippage
         self.replay_id: Optional[str] = None
         self.symbol: Optional[str] = None
         self.broker: Optional[PaperBroker] = None
@@ -37,7 +40,12 @@ class ReplayEngine:
     
     def reset(self):
         """Reset all state for a new replay."""
-        self.broker = PaperBroker(initial_equity=self.initial_equity)
+        self.broker = PaperBroker(
+            initial_equity=self.initial_equity,
+            commission_per_share=self.commission_per_share,
+            commission_per_trade=self.commission_per_trade,
+            slippage=self.slippage
+        )
         self.position_state = PositionState()
         self.candle_history = []
         self.current_candle_index = 0
@@ -106,13 +114,86 @@ class ReplayEngine:
         Process a single candle through the trading pipeline.
         This mirrors the logic in evaluate_strategy_on_candle_close().
         
+        Execution Model:
+        1. Process pending orders from previous candle at current candle OPEN
+        2. Evaluate strategy on current candle CLOSE
+        3. Create pending orders for signals (BUY/EXIT)
+        4. Check stop-losses (create pending EXIT orders)
+        5. Check kill-switch (create pending EXIT orders)
+        
+        Key guarantee: Signals NEVER execute on the same candle.
+        All orders execute at the NEXT candle's OPEN price.
+        
         Args:
             db_session: Database session
             candle: Candle dict with keys: time, open, high, low, close, volume
         
         Returns:
-            Dict with signal/trade info if generated, None otherwise
+            Dict with signal info if generated, None otherwise
+            (Trades execute on next candle open, not returned here)
         """
+        # Process pending orders from previous candle at current candle open
+        # Use open_time for execution timestamp
+        open_time = candle.get("open_time", candle["time"])  # Fallback for backward compatibility
+        executed_trades = self.broker.process_pending_orders(
+            current_open_price=candle["open"],
+            timestamp=open_time
+        )
+        
+        # Update trade records for executed orders
+        for trade in executed_trades:
+            if trade["action"] == "BUY":
+                # FIX 1: CANONICAL TIME HANDLING
+                entry_time = unix_to_utc_datetime(trade["timestamp"])
+                ensure_utc_datetime(entry_time, f"replay BUY entry time for {trade['symbol']}")
+                
+                # FIX 2: EXPLICIT REPLAY ISOLATION
+                if self.replay_id is None:
+                    raise ValueError("Replay ID must be set for replay trades")
+                trade_record = Trade(
+                    symbol=trade["symbol"],
+                    entry_time=entry_time,
+                    entry_price=trade["entry_price"],
+                    shares=trade["shares"],
+                    exit_time=None,
+                    exit_price=None,
+                    pnl=None,
+                    reason=None,
+                    replay_id=self.replay_id
+                )
+                db_session.add(trade_record)
+                db_session.commit()
+                
+                # Update position state if this was the current symbol
+                if trade["symbol"] == self.symbol:
+                    self.position_state.has_position = True
+                    self.position_state.entry_price = trade["entry_price"]
+                    self.position_state.entry_time = trade["timestamp"]
+            
+            elif trade["action"] == "EXIT":
+                # Find open trade and update with exit
+                open_trade = db_session.query(Trade).filter(
+                    Trade.symbol == trade["symbol"],
+                    Trade.exit_time.is_(None),
+                    Trade.replay_id == self.replay_id
+                ).first()
+                
+                if open_trade:
+                    # FIX 1: CANONICAL TIME HANDLING
+                    exit_time = unix_to_utc_datetime(trade["timestamp"])
+                    ensure_utc_datetime(exit_time, f"replay EXIT exit time for {trade['symbol']}")
+                    open_trade.exit_time = exit_time
+                    open_trade.exit_price = trade["exit_price"]
+                    open_trade.pnl = trade["pnl"]
+                    open_trade.reason = trade["reason"]
+                    db_session.commit()
+                
+                # Update position state if this was the current symbol
+                if trade["symbol"] == self.symbol:
+                    self.position_state.has_position = False
+                    self.position_state.entry_price = None
+                    self.position_state.entry_time = None
+        
         # Note: candle_history is already populated from start_replay()
         # We process candles sequentially, using the accumulated history up to current index
         # The current candle is at index current_candle_index - 1
@@ -154,8 +235,9 @@ class ReplayEngine:
         signal_stored = False
         if result["signal"] != "HOLD":
             # FIX 1: CANONICAL TIME HANDLING
-            # Convert Unix timestamp (API boundary) to UTC datetime (internal representation)
-            signal_time = unix_to_utc_datetime(candle["time"])
+            # Use close_time for signal timestamp (signals generated on candle close)
+            close_time = candle.get("close_time", candle["time"])  # Fallback for backward compatibility
+            signal_time = unix_to_utc_datetime(close_time)
             ensure_utc_datetime(signal_time, f"replay signal timestamp for {self.symbol}")
             
             # FIX 2: EXPLICIT REPLAY ISOLATION
@@ -186,6 +268,7 @@ class ReplayEngine:
                 signal_stored = True
         
         # Check stop-losses on every candle close (before processing signals)
+        # Stop-losses create pending orders that execute on next candle open
         current_prices_all = {}
         for sym in self.broker.positions.keys():
             if sym == self.symbol and len(current_history) > 0:
@@ -193,40 +276,17 @@ class ReplayEngine:
         # Add current symbol's price (use current candle)
         current_prices_all[self.symbol] = candle["close"]
         
-        stop_loss_exits = self.broker.check_stop_losses(current_prices_all, candle["time"])
+        # Use close_time for stop-loss checks (checked on candle close)
+        close_time = candle.get("close_time", candle["time"])  # Fallback for backward compatibility
+        stop_loss_orders = self.broker.check_stop_losses(current_prices_all, close_time)
         
-        # Track which symbols had stop-loss exits to prevent double processing
+        # Track which symbols have pending stop-loss exits to prevent double processing
         stop_loss_symbols = set()
+        for exit_order in stop_loss_orders:
+            stop_loss_symbols.add(exit_order["symbol"])
+            # Note: Orders will execute on next candle open, so we don't update trade records here
         
-        # Update trade records for stop-loss exits
-        for exit_trade in stop_loss_exits:
-            stop_loss_symbols.add(exit_trade["symbol"])
-            # FIX 2: EXPLICIT REPLAY ISOLATION
-            # Replay trades: replay_id must match this replay
-            open_trade = db_session.query(Trade).filter(
-                Trade.symbol == exit_trade["symbol"],
-                Trade.exit_time.is_(None),
-                Trade.replay_id == self.replay_id  # Only this replay's trades
-            ).first()
-            
-            if open_trade:
-                # FIX 1: CANONICAL TIME HANDLING
-                exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
-                ensure_utc_datetime(exit_time, f"replay stop-loss exit time for {exit_trade['symbol']}")
-                open_trade.exit_time = exit_time
-                open_trade.exit_price = exit_trade["exit_price"]
-                open_trade.pnl = exit_trade["pnl"]
-                open_trade.reason = exit_trade["reason"]
-                db_session.commit()
-            
-            # Update position state if this was the current symbol
-            if exit_trade["symbol"] == self.symbol:
-                self.position_state.has_position = False
-                self.position_state.entry_price = None
-                self.position_state.entry_time = None
-        
-        # Route signal through paper broker
-        trade_executed = None
+        # Route signal through paper broker (creates pending orders)
         kill_switch_triggered = False
         
         # REGIME GATE: Check if BUY signal is allowed based on current regime
@@ -246,113 +306,50 @@ class ReplayEngine:
             # Calculate stop distance (2 * ATR)
             stop_distance = 2 * current_atr
             
-            # Execute BUY through broker
-            trade_executed = self.broker.execute_buy(
+            # Create pending BUY order (executes on next candle open)
+            # Signal timestamp uses close_time (signal generated on close)
+            close_time = candle.get("close_time", candle["time"])  # Fallback for backward compatibility
+            pending_order = self.broker.execute_buy(
                 symbol=self.symbol,
                 signal_price=candle["close"],
                 stop_distance=stop_distance,
-                timestamp=candle["time"]
+                timestamp=close_time
             )
             
-            if trade_executed:
-                # FIX 1: CANONICAL TIME HANDLING
-                entry_time = unix_to_utc_datetime(candle["time"])
-                ensure_utc_datetime(entry_time, f"replay BUY entry time for {self.symbol}")
-                
-                # FIX 2: EXPLICIT REPLAY ISOLATION
-                # Replay trades: replay_id is UUID (not None)
-                # This ensures replay data never mixes with live trading data
-                if self.replay_id is None:
-                    raise ValueError("Replay ID must be set for replay trades")
-                trade = Trade(
-                    symbol=self.symbol,
-                    entry_time=entry_time,
-                    entry_price=trade_executed["entry_price"],
-                    shares=trade_executed["shares"],
-                    exit_time=None,
-                    exit_price=None,
-                    pnl=None,
-                    reason=None,
-                    replay_id=self.replay_id  # UUID for replays, None for live trading
-                )
-                db_session.add(trade)
-                db_session.commit()
-                
-                # Update position state
-                self.position_state.has_position = True
-                self.position_state.entry_price = trade_executed["entry_price"]
-                self.position_state.entry_time = candle["time"]
+            # Note: Trade record will be created when order executes on next candle open
         
         elif result["signal"] == "EXIT" and self.symbol not in stop_loss_symbols:
-            # Execute EXIT through broker
-            trade_executed = self.broker.execute_exit(
+            # Create pending EXIT order (executes on next candle open)
+            # Signal timestamp uses close_time (signal generated on close)
+            close_time = candle.get("close_time", candle["time"])  # Fallback for backward compatibility
+            pending_order = self.broker.execute_exit(
                 symbol=self.symbol,
                 signal_price=candle["close"],
-                timestamp=candle["time"],
+                timestamp=close_time,
                 reason=result["reason"]
             )
             
-            if trade_executed:
-                # Find open trade and update with exit
-                open_trade = db_session.query(Trade).filter(
-                    Trade.symbol == self.symbol,
-                    Trade.exit_time.is_(None),
-                    Trade.replay_id == self.replay_id
-                ).first()
-                
-                if open_trade:
-                    # FIX 1: CANONICAL TIME HANDLING
-                    exit_time = unix_to_utc_datetime(candle["time"])
-                    ensure_utc_datetime(exit_time, f"replay EXIT time for {self.symbol}")
-                    open_trade.exit_time = exit_time
-                    open_trade.exit_price = trade_executed["exit_price"]
-                    open_trade.pnl = trade_executed["pnl"]
-                    open_trade.reason = trade_executed["reason"]
-                    db_session.commit()
-                
-                # Update position state
-                self.position_state.has_position = False
-                self.position_state.entry_price = None
-                self.position_state.entry_time = None
+            # Note: Trade record will be updated when order executes on next candle open
         
         # Ensure equity is updated before risk checks
         self.broker.update_equity(current_prices_all)
         
         # Check and enforce risk controls on every candle close
-        kill_switch_exits = self.broker.check_and_enforce_risk_controls(current_prices_all, candle["time"])
+        # Kill switch creates pending EXIT orders that execute on next candle open
+        # Use close_time for kill switch checks (checked on candle close)
+        close_time = candle.get("close_time", candle["time"])  # Fallback for backward compatibility
+        kill_switch_orders = self.broker.check_and_enforce_risk_controls(current_prices_all, close_time)
         
-        # Update trade records for kill switch exits
-        for exit_trade in kill_switch_exits:
-            # FIX 2: EXPLICIT REPLAY ISOLATION
-            # Replay trades: replay_id must match this replay
-            open_trade = db_session.query(Trade).filter(
-                Trade.symbol == exit_trade["symbol"],
-                Trade.exit_time.is_(None),
-                Trade.replay_id == self.replay_id  # Only this replay's trades
-            ).first()
-            
-            if open_trade:
-                # FIX 1: CANONICAL TIME HANDLING
-                exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
-                ensure_utc_datetime(exit_time, f"replay kill switch exit time for {exit_trade['symbol']}")
-                open_trade.exit_time = exit_time
-                open_trade.exit_price = exit_trade["exit_price"]
-                open_trade.pnl = exit_trade["pnl"]
-                open_trade.reason = exit_trade["reason"]
-                db_session.commit()
-            
-            # Update position state if this was the current symbol
-            if exit_trade["symbol"] == self.symbol:
-                self.position_state.has_position = False
-                self.position_state.entry_price = None
-                self.position_state.entry_time = None
+        # Note: Orders will execute on next candle open, so we don't update trade records here
         
-        if kill_switch_exits:
+        if kill_switch_orders:
             kill_switch_triggered = True
         
         # Update equity curve
         # FIX 1: CANONICAL TIME HANDLING
-        equity_timestamp = unix_to_utc_datetime(candle["time"])
+        # Use close_time for equity curve (equity calculated on candle close)
+        close_time = candle.get("close_time", candle["time"])  # Fallback for backward compatibility
+        equity_timestamp = unix_to_utc_datetime(close_time)
         ensure_utc_datetime(equity_timestamp, f"replay equity curve timestamp for {self.symbol}")
         
         # FIX 2: EXPLICIT REPLAY ISOLATION
@@ -368,11 +365,11 @@ class ReplayEngine:
         db_session.add(equity_point)
         db_session.commit()
         
-        # Return result with trade info
-        if signal_stored or trade_executed or kill_switch_triggered:
+        # Return result with signal info (trades execute on next candle open)
+        if signal_stored or kill_switch_triggered:
             return {
                 "signal": result if signal_stored else None,
-                "trade": trade_executed,
+                "trade": None,  # Trades execute on next candle open
                 "kill_switch": kill_switch_triggered
             }
         

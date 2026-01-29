@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import csv
 import os
 from pathlib import Path
-from utils import ensure_utc_datetime
+from utils import ensure_utc_datetime, calculate_candle_timestamps
 
 
 def load_csv_candles(csv_path: str, symbol: str = None) -> List[Dict]:
@@ -93,7 +93,8 @@ def load_csv_candles(csv_path: str, symbol: str = None) -> List[Dict]:
                     # Convert to UTC timezone-aware datetime
                     # For daily data: set time to 00:00:00 UTC
                     # For intraday data: preserve the time component
-                    if date_parsed.hour == 0 and date_parsed.minute == 0 and date_parsed.second == 0:
+                    is_daily = date_parsed.hour == 0 and date_parsed.minute == 0 and date_parsed.second == 0
+                    if is_daily:
                         # Daily data - normalize to midnight UTC
                         timestamp = date_parsed.replace(
                             hour=0, minute=0, second=0, microsecond=0,
@@ -103,6 +104,9 @@ def load_csv_candles(csv_path: str, symbol: str = None) -> List[Dict]:
                         # Intraday data - preserve time component, assume UTC
                         timestamp = date_parsed.replace(tzinfo=timezone.utc)
                     timestamp = ensure_utc_datetime(timestamp, f"CSV row {row_count} for {symbol_display}")
+                    
+                    # Calculate open_time and close_time
+                    open_time, close_time = calculate_candle_timestamps(timestamp, is_daily=is_daily)
                     
                     # Parse OHLCV values
                     open_price = float(row['open'])
@@ -129,9 +133,11 @@ def load_csv_candles(csv_path: str, symbol: str = None) -> List[Dict]:
                             f"low={low_price}, close={close_price}, high={high_price}"
                         )
                     
-                    # Create normalized candle
+                    # Create normalized candle with explicit open_time and close_time
                     candle = {
-                        "timestamp": timestamp,
+                        "timestamp": timestamp,  # Keep for backward compatibility
+                        "open_time": open_time,
+                        "close_time": close_time,
                         "open": open_price,
                         "high": high_price,
                         "low": low_price,
@@ -192,12 +198,14 @@ def convert_to_replay_format(candles: List[Dict]) -> List[Dict]:
     Convert normalized candles to ReplayEngine input format.
     
     ReplayEngine expects candles with:
-    - time: Unix timestamp (int)
+    - time: Unix timestamp (int) - kept for backward compatibility, maps to close_time
+    - open_time: Unix timestamp (int) - candle open time
+    - close_time: Unix timestamp (int) - candle close time
     - open, high, low, close: float
     - volume: int
     
     Args:
-        candles: List of normalized candles with timestamp (datetime)
+        candles: List of normalized candles with open_time/close_time (datetime)
     
     Returns:
         List of candles in ReplayEngine format
@@ -205,16 +213,29 @@ def convert_to_replay_format(candles: List[Dict]) -> List[Dict]:
     replay_candles = []
     
     for candle in candles:
-        # Convert timezone-aware datetime to Unix timestamp
-        timestamp_dt = candle["timestamp"]
-        if isinstance(timestamp_dt, datetime):
-            # Convert to Unix timestamp (seconds)
-            unix_timestamp = int(timestamp_dt.timestamp())
+        # Convert open_time and close_time to Unix timestamps
+        open_time_dt = candle.get("open_time")
+        close_time_dt = candle.get("close_time")
+        
+        # Fallback to timestamp for backward compatibility
+        if open_time_dt is None or close_time_dt is None:
+            timestamp_dt = candle.get("timestamp")
+            if isinstance(timestamp_dt, datetime):
+                is_daily = timestamp_dt.hour == 0 and timestamp_dt.minute == 0
+                open_time_dt, close_time_dt = calculate_candle_timestamps(timestamp_dt, is_daily=is_daily)
+            else:
+                raise ValueError(f"Missing open_time/close_time and invalid timestamp: {type(timestamp_dt)}")
+        
+        if isinstance(open_time_dt, datetime) and isinstance(close_time_dt, datetime):
+            open_time_unix = int(open_time_dt.timestamp())
+            close_time_unix = int(close_time_dt.timestamp())
         else:
-            raise ValueError(f"Unexpected timestamp type: {type(timestamp_dt)}")
+            raise ValueError(f"Invalid timestamp types: open_time={type(open_time_dt)}, close_time={type(close_time_dt)}")
         
         replay_candle = {
-            "time": unix_timestamp,
+            "time": close_time_unix,  # Backward compatibility: time maps to close_time
+            "open_time": open_time_unix,
+            "close_time": close_time_unix,
             "open": candle["open"],
             "high": candle["high"],
             "low": candle["low"],

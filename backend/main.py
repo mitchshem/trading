@@ -16,6 +16,7 @@ from indicators import ema, atr
 from strategy import ema_trend_v1, PositionState
 from paper_broker import PaperBroker
 from metrics import compute_metrics
+from promotion_rules import PromotionRules, PromotionThresholds
 from replay_engine import ReplayEngine
 from market_data.yahoo import fetch_yahoo_candles, convert_to_replay_format
 from market_data.csv_loader import load_csv_candles, convert_to_replay_format as csv_convert_to_replay_format
@@ -25,6 +26,8 @@ from regime_metrics import compute_regime_metrics, attach_regime_to_trades
 from intraday_replay import IntradayReplayEngine
 from intraday_diagnostics import compute_intraday_trade_diagnostics, compute_intraday_aggregate_metrics, compute_frequency_and_session_metrics
 from walkforward import filter_candles_by_date_range, compute_window_metrics
+from walkforward_harness import WalkForwardHarness
+from cost_sensitivity import CostSensitivityTester
 from utils import ensure_utc_datetime, unix_to_utc_datetime, fmt, fmt_pct, fmt_currency
 
 # ============================================================================
@@ -116,6 +119,17 @@ broker = PaperBroker(initial_equity=100000.0)
 
 # Global replay engine instance (for daily replays)
 replay_engine = ReplayEngine(initial_equity=100000.0)
+
+# Global promotion rules instance (for live trading gate)
+promotion_rules = PromotionRules(
+    thresholds=PromotionThresholds(
+        max_drawdown_pct=15.0,  # Max 15% drawdown
+        sharpe_proxy_min=0.5,  # Minimum Sharpe proxy of 0.5
+        min_trade_count=20,  # Minimum 20 closed trades
+        min_win_rate=0.40,  # Minimum 40% win rate
+        min_expectancy=0.0  # Positive expectancy required
+    )
+)
 
 # Global intraday replay engine instance (for 5-minute replays)
 # Risk parameters can be overridden per replay via API request
@@ -380,10 +394,51 @@ async def get_equity_curve(limit: int = 1000, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/promotion/status")
+async def get_promotion_status(db: Session = Depends(get_db)):
+    """
+    Check paper trading promotion status.
+    Returns whether live trading is allowed based on objective thresholds.
+    
+    Only includes live trading data (replay_id is None).
+    """
+    # Fetch live trading metrics
+    live_trades = db.query(Trade).filter(Trade.replay_id.is_(None)).all()
+    live_equity = db.query(EquityCurve).filter(EquityCurve.replay_id.is_(None)).order_by(EquityCurve.timestamp).all()
+    
+    # Evaluate promotion
+    decision = promotion_rules.evaluate_promotion(live_trades, live_equity)
+    
+    return {
+        "promoted": decision.promoted,
+        "reasons": decision.reasons,
+        "metrics": decision.metrics,
+        "thresholds": {
+            "max_drawdown_pct": promotion_rules.thresholds.max_drawdown_pct,
+            "sharpe_proxy_min": promotion_rules.thresholds.sharpe_proxy_min,
+            "min_trade_count": promotion_rules.thresholds.min_trade_count,
+            "min_win_rate": promotion_rules.thresholds.min_win_rate,
+            "min_expectancy": promotion_rules.thresholds.min_expectancy
+        }
+    }
+
+
 def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session):
     """
     Evaluate strategy when a candle closes, route through paper broker, and store trades.
     This is called when a new candle is generated (representing a closed candle).
+    
+    Execution Model:
+    1. Process pending orders from previous candle at current candle OPEN
+    2. Evaluate strategy on current candle CLOSE
+    3. Create pending orders for signals (BUY/EXIT)
+    4. Check stop-losses (create pending EXIT orders)
+    5. Check kill-switch (create pending EXIT orders)
+    
+    Key guarantee: Signals NEVER execute on the same candle.
+    All orders execute at the NEXT candle's OPEN price.
+    
+    This ensures identical execution semantics with ReplayEngine.
     
     AUDIT FIX: Prevent duplicate candle processing by checking if candle already exists.
     """
@@ -398,6 +453,71 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     if candle_history[symbol] and candle_history[symbol][-1]["time"] == candle_time:
         # Duplicate candle detected - skip processing
         return None
+    
+    # Process pending orders from previous candle at current candle open
+    # Use open_time for execution timestamp
+    open_time = new_candle.get("open_time", new_candle["time"])  # Fallback for backward compatibility
+    executed_trades = broker.process_pending_orders(
+        current_open_price=new_candle["open"],
+        timestamp=open_time
+    )
+    
+    # Update trade records for executed orders
+    for trade in executed_trades:
+        if trade["action"] == "BUY":
+            # FIX 1: CANONICAL TIME HANDLING
+            entry_time = unix_to_utc_datetime(trade["timestamp"])
+            ensure_utc_datetime(entry_time, f"BUY entry time for {trade['symbol']}")
+            
+            # FIX 2: EXPLICIT REPLAY ISOLATION
+            # Live trading: replay_id is None
+            trade_record = Trade(
+                symbol=trade["symbol"],
+                entry_time=entry_time,
+                entry_price=trade["entry_price"],
+                shares=trade["shares"],
+                exit_time=None,
+                exit_price=None,
+                pnl=None,
+                reason=None,
+                replay_id=None
+            )
+            db.add(trade_record)
+            db.commit()
+            
+            # Update position state if this was the current symbol
+            if trade["symbol"] == symbol:
+                if symbol not in position_states:
+                    position_states[symbol] = PositionState()
+                position_states[symbol].has_position = True
+                position_states[symbol].entry_price = trade["entry_price"]
+                position_states[symbol].entry_time = trade["timestamp"]
+        
+        elif trade["action"] == "EXIT":
+            # Find open trade and update with exit
+            open_trade = db.query(Trade).filter(
+                Trade.symbol == trade["symbol"],
+                Trade.exit_time.is_(None),
+                Trade.replay_id.is_(None)  # Only live trading trades
+            ).first()
+            
+            if open_trade:
+                # FIX 1: CANONICAL TIME HANDLING
+                exit_time = unix_to_utc_datetime(trade["timestamp"])
+                ensure_utc_datetime(exit_time, f"EXIT exit time for {trade['symbol']}")
+                open_trade.exit_time = exit_time
+                open_trade.exit_price = trade["exit_price"]
+                open_trade.pnl = trade["pnl"]
+                open_trade.reason = trade["reason"]
+                db.commit()
+            
+            # Update position state if this was the current symbol
+            if trade["symbol"] == symbol:
+                if symbol not in position_states:
+                    position_states[symbol] = PositionState()
+                position_states[symbol].has_position = False
+                position_states[symbol].entry_price = None
+                position_states[symbol].entry_time = None
     
     # Add new candle to history
     candle_history[symbol].append(new_candle)
@@ -444,8 +564,9 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     signal_stored = False
     if result["signal"] != "HOLD":
         # FIX 1: CANONICAL TIME HANDLING
-        # Convert Unix timestamp (API boundary) to UTC datetime (internal representation)
-        signal_time = unix_to_utc_datetime(new_candle["time"])
+        # Use close_time for signal timestamp (signals generated on candle close)
+        close_time = new_candle.get("close_time", new_candle["time"])  # Fallback for backward compatibility
+        signal_time = unix_to_utc_datetime(close_time)
         ensure_utc_datetime(signal_time, f"signal timestamp for {symbol}")
         
         # FIX 2: EXPLICIT REPLAY ISOLATION
@@ -474,6 +595,7 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     
     # FIX 2: AUTOMATIC STOP-LOSS ENFORCEMENT
     # Check stop-losses on every candle close (before processing signals)
+    # Stop-losses create pending orders that execute on next candle open
     current_prices_all = {}
     for sym in broker.positions.keys():
         if sym in candle_history and len(candle_history[sym]) > 0:
@@ -481,160 +603,83 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     # Add current symbol's price
     current_prices_all[symbol] = new_candle["close"]
     
-    stop_loss_exits = broker.check_stop_losses(current_prices_all, new_candle["time"])
+    # Use close_time for stop-loss checks (checked on candle close)
+    close_time = new_candle.get("close_time", new_candle["time"])  # Fallback for backward compatibility
+    stop_loss_orders = broker.check_stop_losses(current_prices_all, close_time)
     
-    # Track which symbols had stop-loss exits to prevent double processing
+    # Track which symbols have pending stop-loss exits to prevent double processing
     stop_loss_symbols = set()
+    for exit_order in stop_loss_orders:
+        stop_loss_symbols.add(exit_order["symbol"])
+        # Note: Orders will execute on next candle open, so we don't update trade records here
     
-    # Update trade records for stop-loss exits
-    for exit_trade in stop_loss_exits:
-        stop_loss_symbols.add(exit_trade["symbol"])
-        # FIX 2: EXPLICIT REPLAY ISOLATION
-        # Live trading: only query trades with replay_id=None
-        open_trade = db.query(Trade).filter(
-            Trade.symbol == exit_trade["symbol"],
-            Trade.exit_time.is_(None),
-            Trade.replay_id.is_(None)  # Only live trading trades
-        ).first()
-        
-        if open_trade:
-            # FIX 1: CANONICAL TIME HANDLING
-            # Convert Unix timestamp to UTC datetime
-            exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
-            ensure_utc_datetime(exit_time, f"stop-loss exit time for {exit_trade['symbol']}")
-            open_trade.exit_time = exit_time
-            open_trade.exit_price = exit_trade["exit_price"]
-            open_trade.pnl = exit_trade["pnl"]
-            open_trade.reason = exit_trade["reason"]
-            db.commit()
-        
-        # Update position state if this was the current symbol
-        if exit_trade["symbol"] == symbol:
-            position_state.has_position = False
-            position_state.entry_price = None
-            position_state.entry_time = None
-    
-    # Route signal through paper broker
-    trade_executed = None
+    # Route signal through paper broker (creates pending orders)
     kill_switch_triggered = False
     
     # AUDIT FIX: Prevent double EXIT processing - if stop-loss already exited, skip signal EXIT
     if result["signal"] == "BUY" and current_atr is not None and symbol not in stop_loss_symbols:
-        # Calculate stop distance (2 * ATR)
-        stop_distance = 2 * current_atr
+        # PROMOTION RULES: Check if BUY trade is allowed
+        # Fetch live trading metrics (replay_id=None)
+        live_trades = db.query(Trade).filter(Trade.replay_id.is_(None)).all()
+        live_equity = db.query(EquityCurve).filter(EquityCurve.replay_id.is_(None)).order_by(EquityCurve.timestamp).all()
         
-        # Execute BUY through broker
-        trade_executed = broker.execute_buy(
-            symbol=symbol,
-            signal_price=new_candle["close"],
-            stop_distance=stop_distance,
-            timestamp=new_candle["time"]
+        trade_allowed, block_reason = promotion_rules.check_trade_allowed(
+            trades=live_trades,
+            equity_curve=live_equity,
+            trade_type="BUY"
         )
         
-        if trade_executed:
-            # FIX 1: CANONICAL TIME HANDLING
-            # Convert Unix timestamp to UTC datetime
-            entry_time = unix_to_utc_datetime(new_candle["time"])
-            ensure_utc_datetime(entry_time, f"BUY entry time for {symbol}")
+        if not trade_allowed:
+            # Block trade - log signal but don't create pending order
+            print(f"[PROMOTION RULES] BUY signal blocked for {symbol}: {block_reason}")
+            # Signal already stored above, but trade is blocked
+        else:
+            # Calculate stop distance (2 * ATR)
+            stop_distance = 2 * current_atr
             
-            # FIX 2: EXPLICIT REPLAY ISOLATION
-            # Live trading: replay_id is None (replay data uses UUID)
-            trade = Trade(
+            # Create pending BUY order (executes on next candle open)
+            # Signal timestamp uses close_time (signal generated on close)
+            # close_time already defined above
+            pending_order = broker.execute_buy(
                 symbol=symbol,
-                entry_time=entry_time,
-                entry_price=trade_executed["entry_price"],
-                shares=trade_executed["shares"],
-                exit_time=None,
-                exit_price=None,
-                pnl=None,
-                reason=None,
-                replay_id=None  # None for live trading, UUID for replays
+                signal_price=new_candle["close"],
+                stop_distance=stop_distance,
+                timestamp=close_time
             )
-            db.add(trade)
-            db.commit()
             
-            # Update position state
-            position_state.has_position = True
-            position_state.entry_price = trade_executed["entry_price"]
-            position_state.entry_time = new_candle["time"]
+            # Note: Trade record will be created when order executes on next candle open
     
     elif result["signal"] == "EXIT" and symbol not in stop_loss_symbols:
         # AUDIT FIX: Only process signal EXIT if stop-loss didn't already exit this symbol
-        # Execute EXIT through broker
-        trade_executed = broker.execute_exit(
+        # Create pending EXIT order (executes on next candle open)
+        # Signal timestamp uses close_time (signal generated on close)
+        close_time = new_candle.get("close_time", new_candle["time"])  # Fallback for backward compatibility
+        pending_order = broker.execute_exit(
             symbol=symbol,
             signal_price=new_candle["close"],
-            timestamp=new_candle["time"],
+            timestamp=close_time,
             reason=result["reason"]
         )
         
-        if trade_executed:
-            # FIX 2: EXPLICIT REPLAY ISOLATION
-            # Live trading: only query trades with replay_id=None
-            open_trade = db.query(Trade).filter(
-                Trade.symbol == symbol,
-                Trade.exit_time.is_(None),
-                Trade.replay_id.is_(None)  # Only live trading trades
-            ).first()
-            
-            if open_trade:
-                # FIX 1: CANONICAL TIME HANDLING
-                # Convert Unix timestamp to UTC datetime
-                exit_time = unix_to_utc_datetime(new_candle["time"])
-                ensure_utc_datetime(exit_time, f"EXIT time for {symbol}")
-                open_trade.exit_time = exit_time
-                open_trade.exit_price = trade_executed["exit_price"]
-                open_trade.pnl = trade_executed["pnl"]
-                open_trade.reason = trade_executed["reason"]
-                db.commit()
-            
-            # Update position state
-            position_state.has_position = False
-            position_state.entry_price = None
-            position_state.entry_time = None
+        # Note: Trade record will be updated when order executes on next candle open
     
-    # FIX 4: KILL SWITCH BEHAVIOR (FAIL-SAFE)
-    # AUDIT FIX: Ensure equity is updated before risk checks (order matters)
+    # Check kill switch (creates pending orders)
+    # Ensure equity is updated before risk checks
     broker.update_equity(current_prices_all)
+    # Use close_time for kill switch checks (checked on candle close)
+    close_time = new_candle.get("close_time", new_candle["time"])  # Fallback for backward compatibility
+    kill_switch_orders = broker.check_and_enforce_risk_controls(current_prices_all, close_time)
     
-    # Check and enforce risk controls on every candle close
-    # This automatically closes all positions if daily loss limit is breached
-    kill_switch_exits = broker.check_and_enforce_risk_controls(current_prices_all, new_candle["time"])
+    # Note: Orders will execute on next candle open, so we don't update trade records here
     
-    # Update trade records for kill switch exits
-    for exit_trade in kill_switch_exits:
-        # FIX 2: EXPLICIT REPLAY ISOLATION
-        # Live trading: only query trades with replay_id=None
-        open_trade = db.query(Trade).filter(
-            Trade.symbol == exit_trade["symbol"],
-            Trade.exit_time.is_(None),
-            Trade.replay_id.is_(None)  # Only live trading trades
-        ).first()
-        
-        if open_trade:
-            # FIX 1: CANONICAL TIME HANDLING
-            # Convert Unix timestamp to UTC datetime
-            exit_time = unix_to_utc_datetime(exit_trade["timestamp"])
-            ensure_utc_datetime(exit_time, f"kill switch exit time for {exit_trade['symbol']}")
-            open_trade.exit_time = exit_time
-            open_trade.exit_price = exit_trade["exit_price"]
-            open_trade.pnl = exit_trade["pnl"]
-            open_trade.reason = exit_trade["reason"]
-            db.commit()
-        
-        # Update position state if this was the current symbol
-        if exit_trade["symbol"] == symbol:
-            position_state.has_position = False
-            position_state.entry_price = None
-            position_state.entry_time = None
-    
-    if kill_switch_exits:
+    if kill_switch_orders:
         kill_switch_triggered = True
     
     # Update equity curve (equity already updated above for risk checks)
     # FIX 1: CANONICAL TIME HANDLING
-    # Convert Unix timestamp to UTC datetime
-    equity_timestamp = unix_to_utc_datetime(new_candle["time"])
+    # Use close_time for equity curve (equity calculated on candle close)
+    close_time = new_candle.get("close_time", new_candle["time"])  # Fallback for backward compatibility
+    equity_timestamp = unix_to_utc_datetime(close_time)
     ensure_utc_datetime(equity_timestamp, f"equity curve timestamp for {symbol}")
     
     # FIX 2: EXPLICIT REPLAY ISOLATION
@@ -647,11 +692,11 @@ def evaluate_strategy_on_candle_close(symbol: str, new_candle: Dict, db: Session
     db.add(equity_point)
     db.commit()
     
-    # Return result with trade info
+    # Return result with signal info (trades execute on next candle open)
     if signal_stored:
         return {
             "signal": result,
-            "trade": trade_executed,
+            "trade": None,  # Trades execute on next candle open
             "kill_switch": kill_switch_triggered
         }
     
@@ -809,6 +854,23 @@ class WalkForwardRequest(BaseModel):
     max_concurrent_positions: int = 1  # Max concurrent positions
     # Walk-forward windows
     windows: List[WalkForwardWindow]  # List of train/test windows
+
+
+class WalkForwardDailyRequest(BaseModel):
+    """Walk-forward evaluation request for daily replay."""
+    symbol: str  # Single symbol to evaluate
+    start_date: str  # YYYY-MM-DD format (required for days-based windows)
+    end_date: str  # YYYY-MM-DD format (required for days-based windows)
+    train_days: Optional[int] = 252  # Number of trading days in training window (~1 year)
+    test_days: Optional[int] = 63  # Number of trading days in test window (~1 quarter)
+    step_days: Optional[int] = 21  # Number of trading days to step forward (~1 month)
+    train_bars: Optional[int] = None  # Number of candles in training window (alternative to train_days)
+    test_bars: Optional[int] = None  # Number of candles in test window (alternative to test_days)
+    step_bars: Optional[int] = None  # Number of candles to step forward (alternative to step_days)
+    initial_equity: float = 100000.0  # Starting equity for each window
+    allowed_entry_regimes: Optional[List[str]] = None  # Optional regime gate (e.g., ["TREND_UP"])
+    save_artifacts: bool = True  # Whether to save CSV/JSON files
+    output_dir: str = "walkforward_results"  # Directory to save artifacts
 
 
 @app.post("/replay/start")
@@ -2665,6 +2727,236 @@ async def fetch_yahoo_data(request: YahooFetchRequest):
         return {"error": str(e)}, 400
     except Exception as e:
         return {"error": f"Failed to fetch Yahoo Finance data: {str(e)}"}, 500
+
+
+@app.post("/replay/walkforward_daily")
+async def walkforward_daily_replay(request: WalkForwardDailyRequest, db: Session = Depends(get_db)):
+    """
+    Run walk-forward backtest using daily replay with rolling train/test windows.
+    
+    This endpoint implements rolling walk-forward evaluation:
+    - Generates rolling train/test windows automatically
+    - Reuses ReplayEngine for identical execution semantics to replay/live
+    - Outputs per-window metrics and stitched OOS equity curve
+    - Saves artifacts: trades.csv, equity_curve.csv, metrics.json
+    
+    Example payload:
+    {
+      "symbol": "SPY",
+      "start_date": "2020-01-01",
+      "end_date": "2024-12-31",
+      "train_days": 252,
+      "test_days": 63,
+      "step_days": 21,
+      "initial_equity": 100000.0,
+      "allowed_entry_regimes": ["TREND_UP"],
+      "save_artifacts": true,
+      "output_dir": "walkforward_results"
+    }
+    
+    Args:
+        request: WalkForwardDailyRequest with symbol, dates, and window configuration
+    
+    Returns:
+        Dict with window results, aggregate metrics, and artifact paths
+    """
+    # Validate symbol
+    if request.symbol not in ALL_SYMBOLS:
+        return {"error": f"Invalid symbol: {request.symbol}. Must be in allowed list"}, 400
+    
+    # Validate dates
+    try:
+        start_dt = datetime.strptime(request.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(request.end_date, "%Y-%m-%d")
+        if end_dt <= start_dt:
+            return {"error": "End date must be after start date"}, 400
+    except ValueError as e:
+        return {"error": f"Invalid date format. Use YYYY-MM-DD. Error: {e}"}, 400
+    
+    # Validate window configuration
+    if request.train_days <= 0 or request.test_days <= 0 or request.step_days <= 0:
+        return {"error": "train_days, test_days, and step_days must be positive"}, 400
+    
+    if request.initial_equity <= 0:
+        return {"error": "initial_equity must be positive"}, 400
+    
+    # Load daily candles
+    try:
+        print(f"[WALK-FORWARD] Loading daily candles for {request.symbol}")
+        daily_candles_raw = load_daily_candles(request.symbol)
+        daily_candles = csv_convert_to_replay_format(daily_candles_raw)
+        
+        if len(daily_candles) < 200:
+            return {"error": f"Insufficient daily candles: {len(daily_candles)}. Need at least 200 for EMA(200)"}, 400
+        
+        print(f"[WALK-FORWARD] Loaded {len(daily_candles)} daily candles")
+    except FileNotFoundError as e:
+        return {"error": f"Daily data file not found: {str(e)}"}, 404
+    except Exception as e:
+        return {"error": f"Failed to load daily candles: {str(e)}"}, 400
+    
+    # Create walk-forward harness
+    harness = WalkForwardHarness(
+        initial_equity=request.initial_equity,
+        train_days=request.train_days,
+        test_days=request.test_days,
+        step_days=request.step_days,
+        train_bars=request.train_bars,
+        test_bars=request.test_bars,
+        step_bars=request.step_bars
+    )
+    
+    # Run walk-forward
+    try:
+        results = harness.run_walkforward(
+            symbol=request.symbol,
+            candles=daily_candles,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            db_session=db,
+            allowed_entry_regimes=request.allowed_entry_regimes
+        )
+        
+        # Save artifacts if requested
+        artifact_paths = {}
+        if request.save_artifacts:
+            try:
+                artifact_paths = harness.save_artifacts(
+                    output_dir=request.output_dir,
+                    symbol=request.symbol
+                )
+                print(f"[WALK-FORWARD] Saved artifacts to {request.output_dir}")
+            except Exception as e:
+                print(f"[WALK-FORWARD] WARNING: Failed to save artifacts: {str(e)}")
+        
+        results["artifact_paths"] = artifact_paths
+        
+        return results
+    
+    except Exception as e:
+        error_msg = f"Walk-forward backtest failed: {str(e)}"
+        print(f"[WALK-FORWARD] ERROR: {error_msg}")
+        return {"error": error_msg}, 500
+
+
+class CostSensitivityRequest(BaseModel):
+    """Cost sensitivity testing request."""
+    symbol: str
+    start_date: str  # YYYY-MM-DD format
+    end_date: str  # YYYY-MM-DD format
+    initial_equity: float = 100000.0
+    base_slippage: float = 0.0002  # Base slippage (0.02%)
+    slippage_multipliers: Optional[List[float]] = None  # Default: [0.5, 1.0, 2.0]
+    commission_levels: Optional[List[List[float]]] = None  # Default: [[0.0, 0.0], [0.005, 1.0], [0.01, 2.0]]
+    allowed_entry_regimes: Optional[List[str]] = None
+    save_report: bool = True
+    output_dir: str = "cost_sensitivity_results"
+
+
+@app.post("/replay/cost_sensitivity")
+async def cost_sensitivity_test(request: CostSensitivityRequest, db: Session = Depends(get_db)):
+    """
+    Run cost sensitivity test with different slippage and commission levels.
+    
+    This endpoint runs the same replay multiple times with different cost parameters
+    to assess strategy robustness. Results are ranked by robustness score (return / drawdown).
+    
+    Example payload:
+    {
+      "symbol": "SPY",
+      "start_date": "2023-01-01",
+      "end_date": "2023-12-31",
+      "initial_equity": 100000.0,
+      "base_slippage": 0.0002,
+      "slippage_multipliers": [0.5, 1.0, 2.0],
+      "commission_levels": [[0.0, 0.0], [0.005, 1.0], [0.01, 2.0]],
+      "save_report": true
+    }
+    
+    Args:
+        request: CostSensitivityRequest with symbol, dates, and cost parameters
+    
+    Returns:
+        Dict with test results and summary report
+    """
+    # Validate symbol
+    if request.symbol not in ALL_SYMBOLS:
+        return {"error": f"Invalid symbol: {request.symbol}. Must be in allowed list"}, 400
+    
+    # Validate dates
+    try:
+        start_dt = datetime.strptime(request.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(request.end_date, "%Y-%m-%d")
+        if end_dt <= start_dt:
+            return {"error": "End date must be after start date"}, 400
+    except ValueError as e:
+        return {"error": f"Invalid date format. Use YYYY-MM-DD. Error: {e}"}, 400
+    
+    # Load daily candles
+    try:
+        print(f"[COST SENSITIVITY] Loading daily candles for {request.symbol}")
+        daily_candles_raw = load_daily_candles(request.symbol)
+        daily_candles_all = csv_convert_to_replay_format(daily_candles_raw)
+        
+        # Filter by date range
+        daily_candles = filter_candles_by_date_range(
+            daily_candles_all,
+            request.start_date,
+            request.end_date,
+            candle_type="daily"
+        )
+        
+        if len(daily_candles) < 200:
+            return {"error": f"Insufficient daily candles: {len(daily_candles)}. Need at least 200 for EMA(200)"}, 400
+        
+        print(f"[COST SENSITIVITY] Loaded {len(daily_candles)} daily candles ({request.start_date} to {request.end_date})")
+    except FileNotFoundError as e:
+        return {"error": f"Daily data file not found: {str(e)}"}, 404
+    except Exception as e:
+        return {"error": f"Failed to load daily candles: {str(e)}"}, 400
+    
+    # Set defaults if not provided
+    slippage_multipliers = request.slippage_multipliers or [0.5, 1.0, 2.0]
+    commission_levels_raw = request.commission_levels or [[0.0, 0.0], [0.005, 1.0], [0.01, 2.0]]
+    commission_levels = [tuple(level) for level in commission_levels_raw]  # Convert to tuples
+    
+    # Create cost sensitivity tester
+    tester = CostSensitivityTester(
+        initial_equity=request.initial_equity,
+        base_slippage=request.base_slippage,
+        slippage_multipliers=slippage_multipliers,
+        commission_levels=commission_levels
+    )
+    
+    # Run cost sensitivity test
+    try:
+        results = tester.run_cost_sensitivity_test(
+            symbol=request.symbol,
+            candles=daily_candles,
+            db_session=db,
+            allowed_entry_regimes=request.allowed_entry_regimes
+        )
+        
+        # Save report if requested
+        artifact_paths = {}
+        if request.save_report:
+            try:
+                artifact_paths = tester.save_report(
+                    output_dir=request.output_dir,
+                    symbol=request.symbol
+                )
+                print(f"[COST SENSITIVITY] Saved report to {request.output_dir}")
+            except Exception as e:
+                print(f"[COST SENSITIVITY] WARNING: Failed to save report: {str(e)}")
+        
+        results["artifact_paths"] = artifact_paths
+        
+        return results
+    
+    except Exception as e:
+        error_msg = f"Cost sensitivity test failed: {str(e)}"
+        print(f"[COST SENSITIVITY] ERROR: {error_msg}")
+        return {"error": error_msg}, 500
 
 
 if __name__ == "__main__":

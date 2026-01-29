@@ -699,11 +699,12 @@ class IntradayReplayEngine:
         daily_regime = align_intraday_with_daily(candle, self.daily_candles)
         
         # Log intraday candle with daily regime
-        candle_time = candle.get("time")
-        if isinstance(candle_time, (int, float)):
-            candle_dt = datetime.fromtimestamp(candle_time, tz=timezone.utc)
+        # Use close_time for logging (candle processing happens on close)
+        close_time = candle.get("close_time", candle.get("time"))  # Fallback for backward compatibility
+        if isinstance(close_time, (int, float)):
+            candle_dt = datetime.fromtimestamp(close_time, tz=timezone.utc)
         else:
-            candle_dt = candle_time
+            candle_dt = close_time
         
         print(f"[INTRADAY] Processing candle: {candle_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC, "
               f"close={fmt(candle.get('close'))}, daily_regime={daily_regime}, has_position={self.has_position}")
@@ -733,8 +734,11 @@ class IntradayReplayEngine:
             
             if exit_result["signal"] == "EXIT":
                 # Execute exit through risk manager
+                # Exit signal generated on candle close (use close_time for signal)
+                # Execution timestamp uses open_time (executions use open_time)
                 exit_price = candle["close"]
-                exit_time = candle_time
+                open_time = candle.get("open_time", candle.get("time"))  # Fallback for backward compatibility
+                exit_time = open_time  # Execution timestamp (open_time)
                 
                 exit_result_dict = self.risk_manager.exit_position(
                     symbol=self.symbol,
@@ -770,10 +774,11 @@ class IntradayReplayEngine:
                           f"P&L={fmt_currency(pnl)}, equity={fmt_currency(current_equity)}, reason: {exit_result['reason']}")
                     
                     # Record trade
+                    # exit_time is already set to open_time (execution timestamp)
                     self.trades.append({
-                        "entry_time": self.entry_time,
+                        "entry_time": self.entry_time,  # Already set to open_time
                         "entry_price": exit_result_dict["entry_price"],
-                        "exit_time": exit_time,
+                        "exit_time": exit_time,  # Execution timestamp (open_time)
                         "exit_price": fill_exit_price,
                         "shares": exit_result_dict["shares"],
                         "pnl": pnl,
@@ -789,7 +794,7 @@ class IntradayReplayEngine:
                     self.max_favorable_price = None
                 
                 return {
-                    "intraday_timestamp": candle_time,
+                    "intraday_timestamp": close_time,  # Signal timestamp (close_time)
                     "price": candle["close"],
                     "daily_regime": daily_regime,
                     "exit_signal": "EXIT",
@@ -800,11 +805,12 @@ class IntradayReplayEngine:
         # Check for entry signal (if no position)
         if not self.has_position:
             # Debug log before calling entry evaluator
-            candle_time = candle.get("time")
-            if isinstance(candle_time, (int, float)):
-                timestamp_dt = datetime.fromtimestamp(candle_time, tz=timezone.utc)
+            # Entry signal generated on candle close (use close_time for signal)
+            close_time = candle.get("close_time", candle.get("time"))  # Fallback for backward compatibility
+            if isinstance(close_time, (int, float)):
+                timestamp_dt = datetime.fromtimestamp(close_time, tz=timezone.utc)
             else:
-                timestamp_dt = candle_time
+                timestamp_dt = close_time
             print(f"[DEBUG] Calling entry evaluator with entry_variant={self.entry_variant} at {timestamp_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             
             entry_result = evaluate_intraday_entry(
@@ -838,12 +844,14 @@ class IntradayReplayEngine:
                     
                     if can_enter:
                         # Execute entry through risk manager
+                        # Execution timestamp uses open_time (executions use open_time)
+                        open_time = candle.get("open_time", candle.get("time"))  # Fallback for backward compatibility
                         position_info = self.risk_manager.enter_position(
                             symbol=self.symbol,
                             entry_price=entry_price,
                             shares=shares,
                             stop_distance=stop_distance,
-                            timestamp=candle_time,
+                            timestamp=open_time,  # Execution timestamp (open_time)
                             reason=entry_result["reason"]
                         )
                         
@@ -853,7 +861,7 @@ class IntradayReplayEngine:
                             
                             # Store trade entry in database
                             from utils import unix_to_utc_datetime
-                            entry_time_dt = unix_to_utc_datetime(candle_time)
+                            entry_time_dt = unix_to_utc_datetime(open_time)  # Execution timestamp (open_time)
                             
                             trade = Trade(
                                 symbol=self.symbol,
@@ -879,13 +887,13 @@ class IntradayReplayEngine:
                             # Update position state
                             self.has_position = True
                             self.entry_price = fill_entry_price
-                            self.entry_time = candle_time
+                            self.entry_time = open_time  # Execution timestamp (open_time)
                             self.entry_shares = actual_shares
                             self.candles_since_entry = 0  # Reset counter
                             self.max_favorable_price = None  # Reset MFE tracking
                             
                             return {
-                                "intraday_timestamp": candle_time,
+                                "intraday_timestamp": close_time,  # Signal timestamp (close_time)
                                 "price": candle["close"],
                                 "daily_regime": daily_regime,
                                 "entry_signal": "BUY",
@@ -952,7 +960,9 @@ class IntradayReplayEngine:
                 # Exit at final candle close through risk manager
                 final_candle = self.intraday_candles[-1]
                 exit_price = final_candle["close"]
-                exit_time = final_candle["time"]
+                # Use open_time for execution timestamp (executions use open_time)
+                open_time = final_candle.get("open_time", final_candle.get("time"))  # Fallback for backward compatibility
+                exit_time = open_time
                 
                 exit_result_dict = self.risk_manager.exit_position(
                     symbol=self.symbol,

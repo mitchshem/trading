@@ -11,7 +11,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 import yfinance as yf
 import pandas as pd
-from utils import ensure_utc_datetime
+from utils import ensure_utc_datetime, calculate_candle_timestamps
 
 
 def fetch_yahoo_candles(
@@ -128,6 +128,9 @@ def normalize_yahoo_candles(df: pd.DataFrame, symbol: str) -> List[Dict]:
         # FIX 1: CANONICAL TIME HANDLING - Validate and ensure UTC timezone
         timestamp = ensure_utc_datetime(timestamp, f"Yahoo Finance candle for {symbol}")
         
+        # Calculate open_time and close_time for daily candles
+        open_time, close_time = calculate_candle_timestamps(timestamp, is_daily=True)
+        
         # Extract OHLCV values
         open_price = float(row['Open'])
         high_price = float(row['High'])
@@ -139,9 +142,11 @@ def normalize_yahoo_candles(df: pd.DataFrame, symbol: str) -> List[Dict]:
         if pd.isna(open_price) or pd.isna(high_price) or pd.isna(low_price) or pd.isna(close_price) or pd.isna(volume):
             continue
         
-        # Create normalized candle
+        # Create normalized candle with explicit open_time and close_time
         candle = {
-            "timestamp": timestamp,
+            "timestamp": timestamp,  # Keep for backward compatibility
+            "open_time": open_time,
+            "close_time": close_time,
             "open": open_price,
             "high": high_price,
             "low": low_price,
@@ -213,12 +218,14 @@ def convert_to_replay_format(candles: List[Dict]) -> List[Dict]:
     Convert normalized candles to ReplayEngine input format.
     
     ReplayEngine expects candles with:
-    - time: Unix timestamp (int)
+    - time: Unix timestamp (int) - kept for backward compatibility, maps to close_time
+    - open_time: Unix timestamp (int) - candle open time
+    - close_time: Unix timestamp (int) - candle close time
     - open, high, low, close: float
     - volume: int
     
     Args:
-        candles: List of normalized candles with timestamp (datetime)
+        candles: List of normalized candles with open_time/close_time (datetime)
     
     Returns:
         List of candles in ReplayEngine format
@@ -226,16 +233,28 @@ def convert_to_replay_format(candles: List[Dict]) -> List[Dict]:
     replay_candles = []
     
     for candle in candles:
-        # Convert timezone-aware datetime to Unix timestamp
-        timestamp_dt = candle["timestamp"]
-        if isinstance(timestamp_dt, datetime):
-            # Convert to Unix timestamp (seconds)
-            unix_timestamp = int(timestamp_dt.timestamp())
+        # Convert open_time and close_time to Unix timestamps
+        open_time_dt = candle.get("open_time")
+        close_time_dt = candle.get("close_time")
+        
+        # Fallback to timestamp for backward compatibility
+        if open_time_dt is None or close_time_dt is None:
+            timestamp_dt = candle.get("timestamp")
+            if isinstance(timestamp_dt, datetime):
+                open_time_dt, close_time_dt = calculate_candle_timestamps(timestamp_dt, is_daily=True)
+            else:
+                raise ValueError(f"Missing open_time/close_time and invalid timestamp: {type(timestamp_dt)}")
+        
+        if isinstance(open_time_dt, datetime) and isinstance(close_time_dt, datetime):
+            open_time_unix = int(open_time_dt.timestamp())
+            close_time_unix = int(close_time_dt.timestamp())
         else:
-            raise ValueError(f"Unexpected timestamp type: {type(timestamp_dt)}")
+            raise ValueError(f"Invalid timestamp types: open_time={type(open_time_dt)}, close_time={type(close_time_dt)}")
         
         replay_candle = {
-            "time": unix_timestamp,
+            "time": close_time_unix,  # Backward compatibility: time maps to close_time
+            "open_time": open_time_unix,
+            "close_time": close_time_unix,
             "open": candle["open"],
             "high": candle["high"],
             "low": candle["low"],

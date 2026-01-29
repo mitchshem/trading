@@ -56,7 +56,8 @@ def ema_trend_v1(
     current_candle = candles[-1]
     prev_candle = candles[-2]
     current_close = current_candle["close"]
-    current_time = current_candle["time"]
+    # Signals generated on candle close (use close_time)
+    current_time = current_candle.get("close_time", current_candle.get("time"))  # Fallback for backward compatibility
     
     # Get indicator values for current and previous candles
     current_idx = len(candles) - 1

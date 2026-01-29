@@ -5,17 +5,47 @@ Simulates trade execution with deterministic fills and risk controls.
 
 from typing import Dict, Optional, List
 from datetime import datetime, date
+from enum import Enum
 import math
+
+
+class OrderType(Enum):
+    """Order types."""
+    BUY = "BUY"
+    EXIT = "EXIT"
+
+
+class PendingOrder:
+    """Represents a pending order that will execute on the next candle open."""
+    def __init__(self, order_type: OrderType, symbol: str, signal_price: float, timestamp: int, 
+                 stop_distance: Optional[float] = None, reason: Optional[str] = None):
+        self.order_type = order_type
+        self.symbol = symbol
+        self.signal_price = signal_price  # Price from signal (for reference)
+        self.timestamp = timestamp  # Timestamp when order was created
+        self.stop_distance = stop_distance  # For BUY orders only
+        self.reason = reason  # For EXIT orders only
+    
+    def to_dict(self):
+        return {
+            "order_type": self.order_type.value,
+            "symbol": self.symbol,
+            "signal_price": self.signal_price,
+            "timestamp": self.timestamp,
+            "stop_distance": self.stop_distance,
+            "reason": self.reason
+        }
 
 
 class Position:
     """Represents an open position."""
-    def __init__(self, symbol: str, entry_time: int, entry_price: float, shares: int, stop_price: float):
+    def __init__(self, symbol: str, entry_time: int, entry_price: float, shares: int, stop_price: float, entry_commission: float = 0.0):
         self.symbol = symbol
         self.entry_time = entry_time
         self.entry_price = entry_price
         self.shares = shares
         self.stop_price = stop_price
+        self.entry_commission = entry_commission  # Commission paid on entry
     
     def to_dict(self):
         return {
@@ -23,17 +53,44 @@ class Position:
             "entry_time": self.entry_time,
             "entry_price": self.entry_price,
             "shares": self.shares,
-            "stop_price": self.stop_price
+            "stop_price": self.stop_price,
+            "entry_commission": self.entry_commission
         }
 
 
 class PaperBroker:
     """
-    Paper trading broker that executes trades based on signals.
+    Paper trading broker that manages pending orders and executes trades.
+    
+    Execution Model:
+    - Strategies generate signals on candle close
+    - Signals create pending orders (no immediate execution)
+    - Pending orders execute on the next candle open price
+    - Stop-loss and kill-switch exits also create pending orders
+    - All orders execute at candle open with slippage and commissions applied
+    
+    Commission Model:
+    - Configurable per-share commission (e.g., $0.005 per share)
+    - Configurable per-trade commission (e.g., $1.00 per trade)
+    - Commission = (shares * commission_per_share) + commission_per_trade
+    - Commissions deducted on both BUY and EXIT
+    - Commissions reduce realized P&L (included in net P&L calculation)
+    - Commissions deducted from cash on BUY (reduces available cash)
+    - Exit commissions deducted from proceeds on EXIT (reduces cash received)
+    - Equity calculation includes commissions (via cash reduction)
+    - Daily P&L includes commissions (via net P&L calculation)
+    - Kill-switch logic includes commissions (via daily P&L)
+    
+    This ensures:
+    - No lookahead bias (signals on close, execution on next open)
+    - Deterministic execution (same inputs produce same outputs)
+    - Identical execution path for replay and live trading
+    - Realistic trading costs included in P&L
+    
     Tracks account equity, positions, and enforces risk controls.
     """
     
-    def __init__(self, initial_equity: float = 100000.0):
+    def __init__(self, initial_equity: float = 100000.0, commission_per_share: float = 0.005, commission_per_trade: float = 0.0, slippage: float = 0.0002):
         # FIX 1: CASH-BASED EQUITY ACCOUNTING
         # Initialize cash and equity to initial_equity
         self.cash = initial_equity
@@ -43,10 +100,17 @@ class PaperBroker:
         self.daily_pnl = 0.0
         self.last_reset_date = date.today()
         self.trade_blocked = False  # Kill switch flag
-        self.slippage = 0.0002  # 0.02% slippage
+        self.slippage = slippage  # Configurable slippage (default: 0.02% = 0.0002)
+        
+        # Commission model: per-share and per-trade commissions
+        self.commission_per_share = commission_per_share  # e.g., 0.005 = $0.005 per share
+        self.commission_per_trade = commission_per_trade  # e.g., 1.0 = $1.00 per trade
         
         # Track realized P&L for the day
         self.daily_realized_pnl = 0.0
+        
+        # Pending orders queue - orders execute on next candle open
+        self.pending_orders: List[PendingOrder] = []
     
     def reset_daily_stats_if_needed(self):
         """Reset daily stats if it's a new day."""
@@ -80,6 +144,210 @@ class PaperBroker:
         
         return max(0, shares)  # Ensure non-negative
     
+    def _execute_buy_internal(self, symbol: str, fill_price: float, stop_distance: float, timestamp: int) -> Optional[Dict]:
+        """
+        Internal method to execute a BUY order immediately.
+        Called by process_pending_orders when order executes.
+        
+        Args:
+            symbol: Trading symbol
+            fill_price: Fill price (next candle open with slippage)
+            stop_distance: Stop loss distance
+            timestamp: Execution timestamp
+        
+        Returns:
+            Dict with trade info if executed, None if blocked
+        """
+        # Calculate position size
+        shares = self.calculate_position_size(fill_price, stop_distance, self.equity)
+        
+        if shares == 0:
+            return None  # Position too small
+        
+        # Calculate commission
+        commission = self.calculate_commission(shares)
+        
+        # FIX 1: CASH-BASED EQUITY ACCOUNTING
+        # Deduct (shares * fill_price + commission) from cash
+        cost = shares * fill_price
+        total_cost = cost + commission
+        if total_cost > self.cash:
+            return None  # Insufficient cash
+        
+        self.cash -= total_cost
+        
+        # AUDIT FIX: Assert cash never goes negative (fail fast > silent failure)
+        assert self.cash >= 0, f"Cash became negative: {self.cash} after BUY of {shares} shares @ {fill_price} + commission {commission}"
+        
+        # Calculate stop price
+        stop_price = fill_price - stop_distance
+        
+        # Create position (store entry commission for P&L calculation on exit)
+        position = Position(
+            symbol=symbol,
+            entry_time=timestamp,
+            entry_price=fill_price,
+            shares=shares,
+            stop_price=stop_price,
+            entry_commission=commission
+        )
+        
+        self.positions[symbol] = position
+        
+        return {
+            "action": "BUY",
+            "symbol": symbol,
+            "shares": shares,
+            "entry_price": fill_price,
+            "stop_price": stop_price,
+            "entry_commission": commission,
+            "exit_commission": 0.0,  # No exit commission yet
+            "total_commission": commission,  # Only entry commission at this point
+            "net_pnl": None,  # No P&L until exit
+            "timestamp": timestamp
+        }
+    
+    def _execute_exit_internal(self, symbol: str, fill_price: float, timestamp: int, reason: str) -> Optional[Dict]:
+        """
+        Internal method to execute an EXIT order immediately.
+        Called by process_pending_orders when order executes.
+        
+        Args:
+            symbol: Trading symbol
+            fill_price: Fill price (next candle open with slippage)
+            timestamp: Execution timestamp
+            reason: Exit reason
+        
+        Returns:
+            Dict with trade info if executed, None if no position
+        """
+        position = self.positions[symbol]
+        
+        # Calculate exit commission
+        exit_commission = self.calculate_commission(position.shares)
+        total_commission = position.entry_commission + exit_commission
+        
+        # Calculate P&L (gross P&L minus both entry and exit commissions)
+        gross_pnl = (fill_price - position.entry_price) * position.shares
+        net_pnl = gross_pnl - total_commission  # Both entry and exit commissions reduce P&L
+        
+        # FIX 1: CASH-BASED EQUITY ACCOUNTING
+        # Add (shares * fill_price - exit_commission) to cash
+        # Note: Entry commission was already deducted on BUY
+        proceeds = position.shares * fill_price
+        net_proceeds = proceeds - exit_commission
+        self.cash += net_proceeds
+        
+        # AUDIT FIX: Assert cash is valid (fail fast > silent failure)
+        assert self.cash >= 0, f"Cash became negative: {self.cash} after EXIT of {position.shares} shares @ {fill_price} - exit commission {exit_commission}"
+        
+        # Update realized P&L (net P&L includes commission impact)
+        self.daily_realized_pnl += net_pnl
+        
+        # Remove position
+        del self.positions[symbol]
+        
+        return {
+            "action": "EXIT",
+            "symbol": symbol,
+            "shares": position.shares,
+            "entry_price": position.entry_price,
+            "exit_price": fill_price,
+            "pnl": net_pnl,  # Net P&L (after both entry and exit commissions)
+            "net_pnl": net_pnl,  # Explicit net_pnl field (same as pnl)
+            "entry_commission": position.entry_commission,
+            "exit_commission": exit_commission,
+            "total_commission": total_commission,
+            "timestamp": timestamp,
+            "reason": reason
+        }
+    
+    def process_pending_orders(self, current_open_price: float, timestamp: int) -> List[Dict]:
+        """
+        Process all pending orders at the current candle open price.
+        Orders execute at the open price with slippage applied.
+        
+        Args:
+            current_open_price: Current candle open price
+            timestamp: Current timestamp
+        
+        Returns:
+            List of executed trade dicts
+        """
+        self.reset_daily_stats_if_needed()
+        
+        executed_trades = []
+        orders_to_process = list(self.pending_orders)  # Copy list
+        self.pending_orders.clear()  # Clear queue
+        
+        for order in orders_to_process:
+            if order.order_type == OrderType.BUY:
+                # Check if trade is still allowed
+                if self.trade_blocked:
+                    continue
+                
+                # Check if position already exists (may have been created by another order)
+                if order.symbol in self.positions:
+                    continue
+                
+                # Check max positions limit
+                if len(self.positions) >= 3:
+                    continue
+                
+                # Check daily loss limit
+                if self.check_daily_loss_limit():
+                    self.trigger_kill_switch()
+                    continue
+                
+                # Apply slippage to open price
+                fill_price = self.apply_slippage(current_open_price, is_buy=True)
+                
+                # Execute BUY
+                trade = self._execute_buy_internal(
+                    symbol=order.symbol,
+                    fill_price=fill_price,
+                    stop_distance=order.stop_distance,
+                    timestamp=timestamp
+                )
+                
+                if trade:
+                    executed_trades.append(trade)
+            
+            elif order.order_type == OrderType.EXIT:
+                # Check if position still exists (may have been closed by another order)
+                if order.symbol not in self.positions:
+                    continue
+                
+                # Apply slippage to open price
+                fill_price = self.apply_slippage(current_open_price, is_buy=False)
+                
+                # Execute EXIT
+                trade = self._execute_exit_internal(
+                    symbol=order.symbol,
+                    fill_price=fill_price,
+                    timestamp=timestamp,
+                    reason=order.reason or "EXIT"
+                )
+                
+                if trade:
+                    executed_trades.append(trade)
+        
+        return executed_trades
+    
+    def calculate_commission(self, shares: int) -> float:
+        """
+        Calculate commission for a trade.
+        
+        Commission = (shares * commission_per_share) + commission_per_trade
+        
+        Args:
+            shares: Number of shares traded
+        
+        Returns:
+            Total commission amount
+        """
+        return (shares * self.commission_per_share) + self.commission_per_trade
+    
     def apply_slippage(self, price: float, is_buy: bool) -> float:
         """
         Apply slippage to fill price.
@@ -102,11 +370,17 @@ class PaperBroker:
         """
         Check if daily loss limit is breached.
         
+        Commission Integration:
+        - Uses daily_pnl which includes daily_realized_pnl (net P&L with commissions)
+        - Commissions reduce realized P&L, so they're included in kill-switch calculation
+        - Kill-switch triggers based on net losses (after commissions)
+        
         Returns:
             True if daily loss limit is breached (2% of equity)
         """
         self.reset_daily_stats_if_needed()
         max_daily_loss = self.equity * 0.02
+        # daily_pnl includes commissions via daily_realized_pnl (net P&L)
         return self.daily_pnl <= -max_daily_loss
     
     def calculate_unrealized_pnl(self, position: Position, current_price: float) -> float:
@@ -119,6 +393,12 @@ class PaperBroker:
         
         FIX 1: CASH-BASED EQUITY ACCOUNTING
         Equity = cash + sum(unrealized P&L of open positions)
+        
+        Commission Integration:
+        - Commissions are deducted from cash on BUY and EXIT
+        - Since equity = cash + unrealized_pnl, commissions are automatically included
+        - Entry commissions reduce cash immediately on BUY
+        - Exit commissions reduce cash on EXIT (via net_proceeds)
         
         Args:
             current_prices: Dict of symbol -> current price
@@ -133,26 +413,30 @@ class PaperBroker:
                 unrealized_pnl += self.calculate_unrealized_pnl(position, current_price)
         
         # FIX 1: Equity = cash + unrealized P&L (not initial_equity + realized + unrealized)
+        # Commissions are included via cash reduction (entry commissions deducted on BUY,
+        # exit commissions deducted on EXIT via net_proceeds)
         self.equity = self.cash + unrealized_pnl
         
         # AUDIT FIX: Assert equity is valid (fail fast > silent failure)
         assert self.equity >= 0, f"Equity became negative: {self.equity} (cash: {self.cash}, unrealized: {unrealized_pnl})"
         
         # Update daily P&L (realized + unrealized)
+        # daily_realized_pnl includes net P&L (gross P&L - commissions) from closed trades
+        # Commissions are included in daily P&L via daily_realized_pnl
         self.daily_pnl = self.daily_realized_pnl + unrealized_pnl
     
     def execute_buy(self, symbol: str, signal_price: float, stop_distance: float, timestamp: int) -> Optional[Dict]:
         """
-        Execute a BUY order.
+        Create a pending BUY order that will execute on the next candle open.
         
         Args:
             symbol: Trading symbol
-            signal_price: Price from signal
+            signal_price: Price from signal (for reference, actual fill at next open)
             stop_distance: Stop loss distance (2 * ATR)
             timestamp: Current timestamp
         
         Returns:
-            Dict with trade info if executed, None if blocked
+            Dict with pending order info if created, None if blocked
         """
         self.reset_daily_stats_if_needed()
         
@@ -174,61 +458,37 @@ class PaperBroker:
             self.trigger_kill_switch()
             return None
         
-        # Calculate position size
-        shares = self.calculate_position_size(signal_price, stop_distance, self.equity)
-        
-        if shares == 0:
-            return None  # Position too small
-        
-        # Apply slippage
-        fill_price = self.apply_slippage(signal_price, is_buy=True)
-        
-        # FIX 1: CASH-BASED EQUITY ACCOUNTING
-        # Deduct (shares * fill_price) from cash
-        cost = shares * fill_price
-        if cost > self.cash:
-            return None  # Insufficient cash
-        
-        self.cash -= cost
-        
-        # AUDIT FIX: Assert cash never goes negative (fail fast > silent failure)
-        assert self.cash >= 0, f"Cash became negative: {self.cash} after BUY of {shares} shares @ {fill_price}"
-        
-        # Calculate stop price
-        stop_price = fill_price - stop_distance
-        
-        # Create position
-        position = Position(
+        # Create pending BUY order
+        pending_order = PendingOrder(
+            order_type=OrderType.BUY,
             symbol=symbol,
-            entry_time=timestamp,
-            entry_price=fill_price,
-            shares=shares,
-            stop_price=stop_price
+            signal_price=signal_price,
+            timestamp=timestamp,
+            stop_distance=stop_distance
         )
         
-        self.positions[symbol] = position
+        self.pending_orders.append(pending_order)
         
         return {
-            "action": "BUY",
+            "action": "BUY_PENDING",
             "symbol": symbol,
-            "shares": shares,
-            "entry_price": fill_price,
-            "stop_price": stop_price,
+            "signal_price": signal_price,
+            "stop_distance": stop_distance,
             "timestamp": timestamp
         }
     
     def execute_exit(self, symbol: str, signal_price: float, timestamp: int, reason: str) -> Optional[Dict]:
         """
-        Execute an EXIT order.
+        Create a pending EXIT order that will execute on the next candle open.
         
         Args:
             symbol: Trading symbol
-            signal_price: Price from signal
+            signal_price: Price from signal (for reference, actual fill at next open)
             timestamp: Current timestamp
             reason: Exit reason
         
         Returns:
-            Dict with trade info if executed, None if no position
+            Dict with pending order info if created, None if no position
         """
         self.reset_daily_stats_if_needed()
         
@@ -236,35 +496,21 @@ class PaperBroker:
         if symbol not in self.positions:
             return None
         
-        position = self.positions[symbol]
+        # Create pending EXIT order
+        pending_order = PendingOrder(
+            order_type=OrderType.EXIT,
+            symbol=symbol,
+            signal_price=signal_price,
+            timestamp=timestamp,
+            reason=reason
+        )
         
-        # Apply slippage
-        fill_price = self.apply_slippage(signal_price, is_buy=False)
-        
-        # Calculate P&L
-        pnl = (fill_price - position.entry_price) * position.shares
-        
-        # FIX 1: CASH-BASED EQUITY ACCOUNTING
-        # Add (shares * fill_price) to cash
-        proceeds = position.shares * fill_price
-        self.cash += proceeds
-        
-        # AUDIT FIX: Assert cash is valid (fail fast > silent failure)
-        assert self.cash >= 0, f"Cash became negative: {self.cash} after EXIT of {position.shares} shares @ {fill_price}"
-        
-        # Update realized P&L
-        self.daily_realized_pnl += pnl
-        
-        # Remove position
-        del self.positions[symbol]
+        self.pending_orders.append(pending_order)
         
         return {
-            "action": "EXIT",
+            "action": "EXIT_PENDING",
             "symbol": symbol,
-            "shares": position.shares,
-            "entry_price": position.entry_price,
-            "exit_price": fill_price,
-            "pnl": pnl,
+            "signal_price": signal_price,
             "timestamp": timestamp,
             "reason": reason
         }
@@ -280,7 +526,8 @@ class PaperBroker:
     
     def close_all_positions(self, current_prices: Dict[str, float], timestamp: int) -> List[Dict]:
         """
-        Close all open positions (for kill switch).
+        Create pending EXIT orders for all open positions (for kill switch).
+        Orders will execute on next candle open.
         
         FIX 4: KILL SWITCH BEHAVIOR (FAIL-SAFE)
         This is called automatically when kill switch is triggered.
@@ -290,38 +537,39 @@ class PaperBroker:
             timestamp: Current timestamp
         
         Returns:
-            List of exit trade dicts
+            List of pending exit order dicts
         """
-        exits = []
+        pending_exits = []
         symbols_to_close = list(self.positions.keys())
         
         for symbol in symbols_to_close:
             if symbol in current_prices:
-                exit_trade = self.execute_exit(
+                exit_order = self.execute_exit(
                     symbol=symbol,
                     signal_price=current_prices[symbol],
                     timestamp=timestamp,
                     reason="Kill switch triggered"
                 )
-                if exit_trade:
-                    exits.append(exit_trade)
+                if exit_order:
+                    pending_exits.append(exit_order)
         
-        return exits
+        return pending_exits
     
     def check_stop_losses(self, current_prices: Dict[str, float], timestamp: int) -> List[Dict]:
         """
         FIX 2: AUTOMATIC STOP-LOSS ENFORCEMENT
         Check all open positions for stop-loss breaches on candle close.
-        If current price <= stop_price, force EXIT with reason "STOP_LOSS".
+        If current price <= stop_price, create pending EXIT order with reason "STOP_LOSS".
+        Order will execute on next candle open.
         
         Args:
             current_prices: Dict of symbol -> current price (candle close)
             timestamp: Current timestamp
         
         Returns:
-            List of exit trade dicts for stop-loss exits
+            List of pending exit order dicts for stop-loss exits
         """
-        exits = []
+        pending_exits = []
         symbols_to_check = list(self.positions.keys())
         
         for symbol in symbols_to_check:
@@ -329,23 +577,24 @@ class PaperBroker:
                 position = self.positions[symbol]
                 current_price = current_prices[symbol]
                 
-                # FIX 2: If current candle close <= stop_price, force EXIT
+                # FIX 2: If current candle close <= stop_price, create pending EXIT
                 if current_price <= position.stop_price:
-                    exit_trade = self.execute_exit(
+                    exit_order = self.execute_exit(
                         symbol=symbol,
                         signal_price=current_price,
                         timestamp=timestamp,
                         reason="STOP_LOSS"
                     )
-                    if exit_trade:
-                        exits.append(exit_trade)
+                    if exit_order:
+                        pending_exits.append(exit_order)
         
-        return exits
+        return pending_exits
     
     def check_and_enforce_risk_controls(self, current_prices: Dict[str, float], timestamp: int) -> List[Dict]:
         """
         FIX 4: KILL SWITCH BEHAVIOR (FAIL-SAFE)
-        Check daily loss limit and automatically close all positions if breached.
+        Check daily loss limit and automatically create pending EXIT orders for all positions if breached.
+        Orders will execute on next candle open.
         This must be called on every candle close to ensure fail-safe behavior.
         
         Args:
@@ -353,21 +602,18 @@ class PaperBroker:
             timestamp: Current timestamp
         
         Returns:
-            List of exit trade dicts if kill switch triggered, empty list otherwise
+            List of pending exit order dicts if kill switch triggered, empty list otherwise
         """
         # Update equity first to get current daily P&L
         self.update_equity(current_prices)
         
         # Check if daily loss limit is breached
         if self.check_daily_loss_limit() and not self.trade_blocked:
-            # FIX 4: Immediately trigger kill switch and close all positions
+            # FIX 4: Trigger kill switch and create pending EXIT orders for all positions
             self.trigger_kill_switch()
-            exits = self.close_all_positions(current_prices, timestamp)
+            pending_exits = self.close_all_positions(current_prices, timestamp)
             
-            # AUDIT FIX: Assert all positions are closed after kill switch (fail fast)
-            assert len(self.positions) == 0, f"Kill switch triggered but {len(self.positions)} positions remain open"
-            
-            return exits
+            return pending_exits
         
         return []
     
