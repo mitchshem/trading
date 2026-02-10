@@ -17,6 +17,7 @@ from strategy import ema_trend_v1, PositionState
 from paper_broker import PaperBroker
 from metrics import compute_metrics
 from promotion_rules import PromotionRules, PromotionThresholds
+from monitoring import monitor, APITimingMiddleware
 from replay_engine import ReplayEngine
 from market_data.yahoo import fetch_yahoo_candles, convert_to_replay_format
 from market_data.csv_loader import load_csv_candles, convert_to_replay_format as csv_convert_to_replay_format
@@ -52,6 +53,9 @@ app = FastAPI(title="Paper Trading API")
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    # Initialize notification service
+    from notification_service import notifier
+    notifier.load_prefs()
     print("\n" + "=" * 60)
     print("BACKEND STARTED")
     print("=" * 60)
@@ -62,13 +66,35 @@ async def startup_event():
     print("  GET  /replay/history - Get replay summaries")
     print("  GET  /replay/results?replay_id=XXX - Get replay results")
     print("  GET  /replay/status - Get replay status")
+    print("\nLive Trading Endpoints:")
+    print("  POST /live/start - Start live paper trading loop")
+    print("  POST /live/stop - Stop live paper trading loop")
+    print("  GET  /live/status - Get live trading status")
+    print("  GET  /decisions - Get decision log entries")
+    print("  GET  /events - Server-Sent Events (real-time)")
+    print("  GET  /strategies - List all strategies with params")
+    print("  POST /live/switch-strategy - Switch active strategy")
+    print("  PATCH /live/params - Update strategy params")
+    print("  PATCH /risk/limits - Update risk limits")
+    print("  GET  /data/alpaca/status - Alpaca connection status")
+    print("  POST /data/alpaca/test - Test Alpaca connection")
+    print("\nNotification Endpoints:")
+    print("  GET  /notifications/prefs - Get notification preferences")
+    print("  PATCH /notifications/prefs - Update notification preferences")
+    print("  POST /notifications/test-email - Test email delivery")
+    print("  GET  /notifications/history - Recent notification history")
     print("\nOther Key Endpoints:")
     print("  GET  /symbols - List available symbols")
     print("  GET  /candles?symbol=XXX - Get historical candles")
     print("  GET  /account - Get account state")
     print("  GET  /trades - Get trade history")
     print("  GET  /metrics - Get performance metrics")
+    print("  GET  /promotion/status - Promotion readiness check")
     print("  WebSocket /ws - Real-time candle stream")
+    print("\nMonitoring Endpoints:")
+    print("  GET  /monitoring/status - System health snapshot")
+    print("  GET  /monitoring/alerts - Recent alerts")
+    print("  GET  /monitoring/api-stats - API performance stats")
     print("=" * 60 + "\n")
 
 # CORS middleware for frontend
@@ -79,6 +105,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# API timing middleware (Phase 5: monitoring)
+app.add_middleware(APITimingMiddleware)
 
 # Dow 30 symbols
 DOW_30 = [
@@ -406,19 +435,25 @@ async def get_promotion_status(db: Session = Depends(get_db)):
     live_trades = db.query(Trade).filter(Trade.replay_id.is_(None)).all()
     live_equity = db.query(EquityCurve).filter(EquityCurve.replay_id.is_(None)).order_by(EquityCurve.timestamp).all()
     
-    # Evaluate promotion
-    decision = promotion_rules.evaluate_promotion(live_trades, live_equity)
-    
+    # Evaluate promotion (with 0 OOS windows by default — updated when walk-forward runs)
+    decision = promotion_rules.evaluate_promotion(live_trades, live_equity, oos_positive_windows=0)
+
     return {
         "promoted": decision.promoted,
         "reasons": decision.reasons,
         "metrics": decision.metrics,
+        "checks_passed": decision.checks_passed,
+        "checks_total": decision.checks_total,
+        "readiness_pct": decision.readiness_pct,
         "thresholds": {
             "max_drawdown_pct": promotion_rules.thresholds.max_drawdown_pct,
             "sharpe_proxy_min": promotion_rules.thresholds.sharpe_proxy_min,
             "min_trade_count": promotion_rules.thresholds.min_trade_count,
             "min_win_rate": promotion_rules.thresholds.min_win_rate,
-            "min_expectancy": promotion_rules.thresholds.min_expectancy
+            "min_expectancy": promotion_rules.thresholds.min_expectancy,
+            "min_trading_days": promotion_rules.thresholds.min_trading_days,
+            "min_profit_factor": promotion_rules.thresholds.min_profit_factor,
+            "min_oos_windows_positive": promotion_rules.thresholds.min_oos_windows_positive,
         }
     }
 
@@ -2957,6 +2992,747 @@ async def cost_sensitivity_test(request: CostSensitivityRequest, db: Session = D
         error_msg = f"Cost sensitivity test failed: {str(e)}"
         print(f"[COST SENSITIVITY] ERROR: {error_msg}")
         return {"error": error_msg}, 500
+
+
+# ============================================================================
+# LIVE TRADING LOOP ENDPOINTS (Phase 2)
+# ============================================================================
+
+from live_trading_loop import LiveTradingLoop
+from decision_log import get_decisions, count_decisions
+from database import DecisionLog
+
+# Global live trading loop instance
+_live_loop: Optional[LiveTradingLoop] = None
+
+
+class LiveStartRequest(BaseModel):
+    """Request to start the live trading loop."""
+    symbol: str = "SPY"
+    strategy_name: str = "ema_trend_v1"
+    strategy_params: Optional[Dict] = None
+    initial_equity: float = 100000.0
+    interval_seconds: float = 60.0
+    is_daily: bool = True
+    data_provider: str = "auto"  # "auto" (Alpaca→Yahoo), "alpaca", or "yahoo"
+
+
+@app.post("/live/start")
+async def live_start(request: LiveStartRequest):
+    """Start the live paper trading loop."""
+    global _live_loop
+
+    if _live_loop is not None and _live_loop.state.status.value == "running":
+        return {"error": "Live trading loop is already running. Stop it first."}
+
+    try:
+        _live_loop = LiveTradingLoop(
+            symbol=request.symbol,
+            strategy_name=request.strategy_name,
+            strategy_params=request.strategy_params,
+            initial_equity=request.initial_equity,
+            interval_seconds=request.interval_seconds,
+            is_daily=request.is_daily,
+            data_provider=request.data_provider,
+        )
+        result = await _live_loop.start()
+        return {"message": "Live trading loop started", "status": result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/live/stop")
+async def live_stop():
+    """Stop the live paper trading loop."""
+    global _live_loop
+
+    if _live_loop is None:
+        return {"error": "No live trading loop running"}
+
+    _live_loop.stop()
+    return {"message": "Live trading loop stopped", "status": _live_loop.get_status()}
+
+
+@app.get("/live/status")
+async def live_status():
+    """Get the current live trading loop status."""
+    global _live_loop
+
+    if _live_loop is None:
+        return {"status": "idle", "message": "No live trading loop has been started"}
+
+    return _live_loop.get_status()
+
+
+@app.get("/decisions")
+async def get_decision_logs(
+    symbol: Optional[str] = None,
+    replay_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """
+    Get decision log entries.
+
+    Query params:
+      - symbol: Filter by symbol
+      - replay_id: Filter by replay_id (omit for live trading only)
+      - limit: Max records (default 100)
+      - offset: Skip records (for pagination)
+    """
+    decisions = get_decisions(db, symbol=symbol, replay_id=replay_id,
+                             limit=limit, offset=offset)
+    total = count_decisions(db, symbol=symbol, replay_id=replay_id)
+    return {
+        "decisions": decisions,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+# ============================================================================
+# Phase 6 Sprint 4: Interactive Controls — Strategy, Params, Risk Limits
+# ============================================================================
+
+import strategy_registry as sr
+
+
+@app.get("/strategies")
+async def get_strategies():
+    """List all registered strategies with metadata for the UI."""
+    strategies = []
+    for name in sr.list_strategies():
+        config = sr.get_strategy(name)
+        strategies.append({
+            "name": config.name,
+            "description": config.description,
+            "default_params": config.default_params,
+            "param_ranges": config.param_ranges,
+        })
+    return {"strategies": strategies}
+
+
+class SwitchStrategyRequest(BaseModel):
+    """Request to switch the live loop's active strategy."""
+    strategy_name: str
+    strategy_params: Optional[Dict] = None  # None → use strategy defaults
+    force: bool = False  # Required if open position exists
+
+
+@app.post("/live/switch-strategy")
+async def live_switch_strategy(request: SwitchStrategyRequest):
+    """
+    Switch the live loop to a different strategy.
+    Stops the current loop, creates a new one with the new strategy,
+    and preserves broker state (equity, positions, risk tracking).
+    """
+    global _live_loop
+
+    if _live_loop is None or _live_loop.state.status.value != "running":
+        return {"error": "No live trading loop is currently running"}
+
+    # Validate strategy exists
+    try:
+        new_config = sr.get_strategy(request.strategy_name)
+    except KeyError as e:
+        return {"error": str(e)}
+
+    # Check for open positions
+    old_broker = _live_loop.broker
+    has_positions = len(old_broker.positions) > 0
+    warning = None
+
+    if has_positions and not request.force:
+        symbols = list(old_broker.positions.keys())
+        return {
+            "error": f"Open position(s) in {', '.join(symbols)}. Set force=true to switch anyway, or close positions first."
+        }
+
+    if has_positions and request.force:
+        symbols = list(old_broker.positions.keys())
+        warning = f"Open position(s) in {', '.join(symbols)} preserved (not closed)"
+
+    # Snapshot current state
+    old_symbol = _live_loop.state.symbol
+    old_interval = _live_loop.state.interval_seconds
+    old_is_daily = _live_loop.state.is_daily
+    old_data_provider = _live_loop.data_provider
+    old_candle_history = list(_live_loop.candle_history)
+    old_position_state = _live_loop.position_state
+
+    # Stop current loop
+    _live_loop.stop()
+    # Brief wait for clean shutdown
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.1)
+
+    # Create new loop with new strategy
+    try:
+        new_loop = LiveTradingLoop(
+            symbol=old_symbol,
+            strategy_name=request.strategy_name,
+            strategy_params=request.strategy_params,
+            initial_equity=old_broker.equity,  # Use current equity as "initial"
+            interval_seconds=old_interval,
+            is_daily=old_is_daily,
+            data_provider=old_data_provider,
+        )
+
+        # Transfer broker state
+        new_loop.broker.cash = old_broker.cash
+        new_loop.broker.equity = old_broker.equity
+        new_loop.broker.positions = old_broker.positions
+        new_loop.broker.pending_orders = old_broker.pending_orders
+        new_loop.broker.high_water_mark = old_broker.high_water_mark
+        new_loop.broker.weekly_pnl = old_broker.weekly_pnl
+        new_loop.broker.monthly_pnl = old_broker.monthly_pnl
+        new_loop.broker.daily_pnl = old_broker.daily_pnl
+        new_loop.broker.daily_realized_pnl = old_broker.daily_realized_pnl
+        new_loop.broker.consecutive_losing_days = old_broker.consecutive_losing_days
+        new_loop.broker.trade_blocked = old_broker.trade_blocked
+        new_loop.broker.pause_until_date = old_broker.pause_until_date
+
+        # Transfer risk limit settings
+        new_loop.broker.max_daily_loss_pct = old_broker.max_daily_loss_pct
+        new_loop.broker.max_weekly_loss_pct = old_broker.max_weekly_loss_pct
+        new_loop.broker.max_monthly_loss_pct = old_broker.max_monthly_loss_pct
+        new_loop.broker.max_consecutive_losing_days = old_broker.max_consecutive_losing_days
+        new_loop.broker.max_drawdown_from_hwm_pct = old_broker.max_drawdown_from_hwm_pct
+        new_loop.broker.max_portfolio_exposure_pct = old_broker.max_portfolio_exposure_pct
+        new_loop.broker.vol_adjustment_enabled = old_broker.vol_adjustment_enabled
+
+        # Transfer position state and candle history
+        new_loop.position_state = old_position_state
+        new_loop.candle_history = old_candle_history
+
+        _live_loop = new_loop
+        result = await _live_loop.start()
+
+        # Emit SSE event
+        broadcaster.publish("strategy_switched", {
+            "strategy_name": request.strategy_name,
+            "strategy_params": _live_loop.state.strategy_params,
+            "warning": warning,
+        })
+
+        return {
+            "message": f"Strategy switched to {request.strategy_name}",
+            "warning": warning,
+            "status": result,
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to switch strategy: {str(e)}"}
+
+
+class UpdateParamsRequest(BaseModel):
+    """Request to update strategy parameters on the running loop."""
+    params: Dict[str, Any]
+
+
+@app.patch("/live/params")
+async def live_update_params(request: UpdateParamsRequest):
+    """
+    Hot-reload strategy parameters on the running loop.
+    Takes effect on the next evaluation cycle (no restart needed).
+    """
+    global _live_loop
+
+    if _live_loop is None or _live_loop.state.status.value != "running":
+        return {"error": "No live trading loop is currently running"}
+
+    config = _live_loop._strategy_config
+    default_params = config.default_params
+    param_ranges = config.param_ranges
+
+    # Validate keys
+    invalid_keys = [k for k in request.params if k not in default_params]
+    if invalid_keys:
+        return {"error": f"Unknown parameter(s): {', '.join(invalid_keys)}. Valid: {', '.join(default_params.keys())}"}
+
+    # Validate ranges
+    range_errors = []
+    for key, value in request.params.items():
+        if key in param_ranges:
+            valid_range = param_ranges[key]
+            min_val = min(valid_range)
+            max_val = max(valid_range)
+            if isinstance(value, (int, float)) and not (min_val <= value <= max_val):
+                range_errors.append(f"{key}: {value} not in [{min_val}, {max_val}]")
+    if range_errors:
+        return {"error": f"Parameter(s) out of range: {'; '.join(range_errors)}"}
+
+    # Snapshot and update
+    previous_params = dict(_live_loop.state.strategy_params)
+    _live_loop.state.strategy_params.update(request.params)
+    current_params = dict(_live_loop.state.strategy_params)
+
+    # Emit SSE event
+    broadcaster.publish("params_updated", {
+        "previous_params": previous_params,
+        "current_params": current_params,
+    })
+
+    return {
+        "message": "Strategy params updated",
+        "previous_params": previous_params,
+        "current_params": current_params,
+        "status": _live_loop.get_status(),
+    }
+
+
+class UpdateRiskLimitsRequest(BaseModel):
+    """Request to update risk limits on the live broker."""
+    max_daily_loss_pct: Optional[float] = None
+    max_weekly_loss_pct: Optional[float] = None
+    max_monthly_loss_pct: Optional[float] = None
+    max_consecutive_losing_days: Optional[int] = None
+    max_drawdown_from_hwm_pct: Optional[float] = None
+    max_portfolio_exposure_pct: Optional[float] = None
+    vol_adjustment_enabled: Optional[bool] = None
+
+
+# Validation bounds for risk limits
+_RISK_LIMIT_BOUNDS = {
+    "max_daily_loss_pct": (0.001, 0.10),
+    "max_weekly_loss_pct": (0.005, 0.20),
+    "max_monthly_loss_pct": (0.01, 0.30),
+    "max_consecutive_losing_days": (1, 20),
+    "max_drawdown_from_hwm_pct": (0.01, 0.50),
+    "max_portfolio_exposure_pct": (0.10, 1.0),
+}
+
+
+@app.patch("/risk/limits")
+async def update_risk_limits(request: UpdateRiskLimitsRequest):
+    """
+    Update risk limits on the live broker. Only specified fields are updated.
+    Changes take effect immediately on the next risk check.
+    """
+    global _live_loop
+
+    if _live_loop is None:
+        return {"error": "No live trading loop running"}
+
+    broker = _live_loop.broker
+    updates = request.dict(exclude_none=True)
+
+    if not updates:
+        return {"error": "No fields provided to update"}
+
+    # Validate bounds
+    errors = []
+    for field, value in updates.items():
+        if field in _RISK_LIMIT_BOUNDS:
+            lo, hi = _RISK_LIMIT_BOUNDS[field]
+            if not (lo <= value <= hi):
+                errors.append(f"{field}: {value} not in [{lo}, {hi}]")
+    if errors:
+        return {"error": f"Validation failed: {'; '.join(errors)}"}
+
+    # Snapshot previous
+    previous_limits = {
+        "max_daily_loss_pct": broker.max_daily_loss_pct,
+        "max_weekly_loss_pct": broker.max_weekly_loss_pct,
+        "max_monthly_loss_pct": broker.max_monthly_loss_pct,
+        "max_consecutive_losing_days": broker.max_consecutive_losing_days,
+        "max_drawdown_from_hwm_pct": broker.max_drawdown_from_hwm_pct,
+        "max_portfolio_exposure_pct": broker.max_portfolio_exposure_pct,
+        "vol_adjustment_enabled": broker.vol_adjustment_enabled,
+    }
+
+    # Apply updates
+    for field, value in updates.items():
+        setattr(broker, field, value)
+
+    current_limits = {
+        "max_daily_loss_pct": broker.max_daily_loss_pct,
+        "max_weekly_loss_pct": broker.max_weekly_loss_pct,
+        "max_monthly_loss_pct": broker.max_monthly_loss_pct,
+        "max_consecutive_losing_days": broker.max_consecutive_losing_days,
+        "max_drawdown_from_hwm_pct": broker.max_drawdown_from_hwm_pct,
+        "max_portfolio_exposure_pct": broker.max_portfolio_exposure_pct,
+        "vol_adjustment_enabled": broker.vol_adjustment_enabled,
+    }
+
+    # Emit SSE event
+    broadcaster.publish("risk_limits_updated", {
+        "previous_limits": previous_limits,
+        "current_limits": current_limits,
+    })
+
+    return {
+        "message": "Risk limits updated",
+        "previous_limits": previous_limits,
+        "current_limits": current_limits,
+    }
+
+
+# ── Alpaca Connection Status ──
+
+@app.get("/data/alpaca/status")
+async def alpaca_status():
+    """Check if Alpaca API keys are configured and return masked key."""
+    from market_data.alpaca_client import alpaca_service
+    import os
+
+    configured = alpaca_service.is_configured()
+    api_key = os.environ.get("ALPACA_API_KEY", "")
+    masked = None
+    if api_key and len(api_key) >= 7:
+        masked = api_key[:4] + "..." + api_key[-3:]
+    elif api_key:
+        masked = "***"
+
+    return {
+        "configured": configured,
+        "api_key_masked": masked,
+    }
+
+
+@app.post("/data/alpaca/test")
+async def alpaca_test_connection():
+    """Test the Alpaca connection by fetching a SPY snapshot."""
+    from market_data.alpaca_client import alpaca_service
+
+    if not alpaca_service.is_configured():
+        return {
+            "success": False,
+            "message": "Alpaca API keys not configured. Set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables.",
+        }
+
+    result = alpaca_service.fetch_snapshot("SPY")
+    if result is not None:
+        return {
+            "success": True,
+            "message": "Successfully connected to Alpaca and fetched SPY snapshot",
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Alpaca API returned no data. Check your API keys and network connection.",
+        }
+
+
+# ============================================================================
+# Phase 6 Sprint 5: Notification Preferences Endpoints
+# ============================================================================
+
+from notification_service import notifier
+
+
+class NotificationPrefsUpdate(BaseModel):
+    """Request to update notification preferences. All fields optional for partial update."""
+    email_enabled: Optional[bool] = None
+    browser_enabled: Optional[bool] = None
+    email_address: Optional[str] = None
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_use_tls: Optional[bool] = None
+    min_severity: Optional[str] = None  # "info", "warning", "critical"
+    email_categories: Optional[Dict[str, bool]] = None
+    browser_categories: Optional[Dict[str, bool]] = None
+
+
+@app.get("/notifications/prefs")
+async def get_notification_prefs(db: Session = Depends(get_db)):
+    """Get current notification preferences."""
+    from database import NotificationPrefs
+    prefs = db.query(NotificationPrefs).filter_by(id=1).first()
+    if prefs is None:
+        prefs = NotificationPrefs(id=1)
+        db.add(prefs)
+        db.commit()
+        db.refresh(prefs)
+    return prefs.to_dict()
+
+
+@app.patch("/notifications/prefs")
+async def update_notification_prefs(body: NotificationPrefsUpdate, db: Session = Depends(get_db)):
+    """Update notification preferences. Partial updates supported."""
+    from database import NotificationPrefs
+    prefs = db.query(NotificationPrefs).filter_by(id=1).first()
+    if prefs is None:
+        prefs = NotificationPrefs(id=1)
+        db.add(prefs)
+        db.commit()
+        db.refresh(prefs)
+
+    # Apply scalar fields
+    scalar_fields = [
+        "email_enabled", "browser_enabled", "email_address",
+        "smtp_host", "smtp_port", "smtp_user", "smtp_password",
+        "smtp_use_tls", "min_severity",
+    ]
+    for field_name in scalar_fields:
+        value = getattr(body, field_name)
+        if value is not None:
+            if isinstance(value, bool):
+                setattr(prefs, field_name, 1 if value else 0)
+            else:
+                setattr(prefs, field_name, value)
+
+    # Validate min_severity
+    if body.min_severity is not None and body.min_severity not in ("info", "warning", "critical"):
+        return {"error": f"Invalid min_severity: {body.min_severity}. Must be info, warning, or critical."}
+
+    # Apply per-category toggles
+    if body.email_categories:
+        for cat, enabled in body.email_categories.items():
+            col_name = f"email_{cat}"
+            if hasattr(prefs, col_name):
+                setattr(prefs, col_name, 1 if enabled else 0)
+
+    if body.browser_categories:
+        for cat, enabled in body.browser_categories.items():
+            col_name = f"browser_{cat}"
+            if hasattr(prefs, col_name):
+                setattr(prefs, col_name, 1 if enabled else 0)
+
+    prefs.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(prefs)
+
+    # Reload cached prefs in notification service
+    notifier.load_prefs()
+
+    return {"message": "Notification preferences updated", "prefs": prefs.to_dict()}
+
+
+@app.post("/notifications/test-email")
+async def test_email_notification():
+    """Send a test email to verify SMTP configuration."""
+    notifier.load_prefs()  # Ensure latest config
+    result = await notifier.send_test_email()
+    return result
+
+
+@app.get("/notifications/history")
+async def get_notification_history(limit: int = 20):
+    """Get recent notification history (from monitoring alerts)."""
+    alerts = monitor.get_recent_alerts(limit=limit)
+    return {"notifications": alerts, "total": len(alerts)}
+
+
+# ============================================================================
+# Phase 6 Sprint 3: Server-Sent Events (SSE) Endpoint
+# ============================================================================
+
+from starlette.responses import StreamingResponse
+from sse_broadcaster import broadcaster
+
+
+async def _sse_event_generator():
+    """
+    Async generator that yields SSE-formatted events.
+    Subscribes to the broadcaster and yields events as they arrive.
+    Sends heartbeat every 15 seconds to keep the connection alive.
+    """
+    queue = broadcaster.subscribe()
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                yield broadcaster.format_sse(event)
+            except asyncio.TimeoutError:
+                # Send heartbeat to keep connection alive
+                hb = broadcaster.heartbeat_event()
+                yield broadcaster.format_sse(hb)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        broadcaster.unsubscribe(queue)
+
+
+@app.get("/events")
+async def sse_events():
+    """
+    Server-Sent Events endpoint for real-time frontend updates.
+
+    Event types:
+    - equity_update: Equity, PnL, positions after each evaluation
+    - trade_executed: BUY/EXIT/STOP_LOSS actions
+    - decision_logged: Strategy evaluation decisions
+    - alert_fired: System alerts from monitoring
+    - loop_status: Live loop start/stop status changes
+    - heartbeat: Keep-alive (every 15s)
+    """
+    return StreamingResponse(
+        _sse_event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================================================
+# Phase 5: Monitoring & System Health Endpoints
+# ============================================================================
+
+@app.get("/monitoring/status")
+async def monitoring_status():
+    """Get comprehensive system health snapshot."""
+    return monitor.get_system_status()
+
+
+@app.get("/monitoring/alerts")
+async def monitoring_alerts(limit: int = 20):
+    """Get recent system alerts."""
+    return {"alerts": monitor.get_recent_alerts(limit=limit)}
+
+
+@app.get("/monitoring/api-stats")
+async def monitoring_api_stats(last_minutes: int = 5):
+    """Get API performance stats."""
+    return monitor.get_api_stats(last_minutes=last_minutes)
+
+
+# ============================================================================
+# Phase 6 Sprint 1: Risk State & Metrics Aggregation Endpoints
+# ============================================================================
+
+@app.get("/risk/state")
+async def get_risk_state():
+    """
+    Get comprehensive risk control state from live PaperBroker.
+    Exposes weekly_pnl, monthly_pnl, HWM drawdown, consecutive losing days,
+    all breach flags, and configured limits.
+    """
+    global _live_loop
+
+    if _live_loop is None or _live_loop.broker is None:
+        # No live loop running — return default state
+        return {
+            "any_breached": False,
+            "daily_breached": False,
+            "weekly_breached": False,
+            "monthly_breached": False,
+            "hwm_drawdown_breached": False,
+            "consecutive_days_breached": False,
+            "is_paused": False,
+            "details": {
+                "daily_pnl": 0.0,
+                "weekly_pnl": 0.0,
+                "monthly_pnl": 0.0,
+                "high_water_mark": 100000.0,
+                "drawdown_from_hwm_pct": 0.0,
+                "consecutive_losing_days": 0,
+                "pause_until_date": None,
+            },
+            "limits": {
+                "max_daily_loss_pct": 0.02,
+                "max_weekly_loss_pct": 0.05,
+                "max_monthly_loss_pct": 0.10,
+                "max_drawdown_from_hwm_pct": 0.15,
+                "max_consecutive_losing_days": 5,
+                "max_portfolio_exposure_pct": 0.80,
+            },
+            "equity": 100000.0,
+            "trade_blocked": False,
+        }
+
+    broker = _live_loop.broker
+    symbol = _live_loop.state.symbol
+
+    # Get current price for equity calculation
+    current_prices = {}
+    if symbol and symbol in broker.positions:
+        # Use last known price from candle history
+        if _live_loop.candle_history:
+            current_prices[symbol] = _live_loop.candle_history[-1].get("close", broker.positions[symbol].entry_price)
+        else:
+            current_prices[symbol] = broker.positions[symbol].entry_price
+
+    import time as _time
+    risk_state = broker.check_all_risk_controls(current_prices, int(_time.time()))
+
+    # Add limits and equity info
+    risk_state["limits"] = {
+        "max_daily_loss_pct": broker.max_daily_loss_pct,
+        "max_weekly_loss_pct": broker.max_weekly_loss_pct,
+        "max_monthly_loss_pct": broker.max_monthly_loss_pct,
+        "max_drawdown_from_hwm_pct": broker.max_drawdown_from_hwm_pct,
+        "max_consecutive_losing_days": broker.max_consecutive_losing_days,
+        "max_portfolio_exposure_pct": broker.max_portfolio_exposure_pct,
+    }
+    risk_state["equity"] = round(broker.equity, 2)
+    risk_state["trade_blocked"] = broker.trade_blocked
+
+    return risk_state
+
+
+@app.get("/metrics/monthly-returns")
+async def get_monthly_returns(db: Session = Depends(get_db)):
+    """
+    Aggregate monthly returns from live trading trades.
+    Returns a list of {year, month, return_pct, pnl, trade_count}.
+    """
+    from collections import defaultdict
+
+    live_trades = db.query(Trade).filter(
+        Trade.replay_id.is_(None),
+        Trade.exit_time.isnot(None),
+    ).all()
+
+    monthly: Dict[str, Dict] = {}
+
+    for trade in live_trades:
+        if trade.exit_time is None or trade.pnl is None:
+            continue
+        exit_time = trade.exit_time
+        if isinstance(exit_time, str):
+            try:
+                exit_time = datetime.fromisoformat(exit_time)
+            except (ValueError, TypeError):
+                continue
+
+        key = f"{exit_time.year}-{exit_time.month:02d}"
+        if key not in monthly:
+            monthly[key] = {"year": exit_time.year, "month": exit_time.month, "pnl": 0.0, "trade_count": 0}
+        monthly[key]["pnl"] += trade.pnl or 0
+        monthly[key]["trade_count"] += 1
+
+    # Compute return_pct (approximate: pnl relative to 100k base)
+    result = []
+    for key in sorted(monthly.keys()):
+        data = monthly[key]
+        data["return_pct"] = round(data["pnl"] / 100000.0 * 100, 2)
+        data["pnl"] = round(data["pnl"], 2)
+        result.append(data)
+
+    return {"monthly_returns": result}
+
+
+@app.get("/metrics/trade-distribution")
+async def get_trade_distribution(db: Session = Depends(get_db)):
+    """
+    Return P&L per closed trade for histogram visualization.
+    Returns list of {id, pnl, symbol, exit_time, is_win}.
+    """
+    live_trades = db.query(Trade).filter(
+        Trade.replay_id.is_(None),
+        Trade.exit_time.isnot(None),
+    ).order_by(Trade.exit_time).all()
+
+    result = []
+    for trade in live_trades:
+        pnl = trade.pnl or 0
+        result.append({
+            "id": trade.id,
+            "pnl": round(pnl, 2),
+            "symbol": trade.symbol,
+            "exit_time": str(trade.exit_time) if trade.exit_time else None,
+            "is_win": pnl > 0,
+        })
+
+    return {"trades": result, "count": len(result)}
 
 
 if __name__ == "__main__":

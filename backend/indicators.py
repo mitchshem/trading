@@ -3,7 +3,7 @@ Technical indicators module.
 Pure Python implementations (no TA-Lib dependency).
 """
 
-from typing import List
+from typing import List, Optional
 
 
 def ema(prices: List[float], period: int) -> List[float]:
@@ -34,6 +34,58 @@ def ema(prices: List[float], period: int) -> List[float]:
         ema_values.append(ema_value)
     
     return ema_values
+
+
+def rsi(prices: List[float], period: int = 14) -> List[Optional[float]]:
+    """
+    Calculate Relative Strength Index (RSI).
+
+    Uses the smoothed (Wilder) method: initial average is SMA of first
+    ``period`` gains/losses, then exponentially smoothed with alpha = 1/period.
+
+    Args:
+        prices: List of price values (typically closes).
+        period: RSI period (default 14).
+
+    Returns:
+        List of RSI values (same length as prices, None where insufficient data).
+    """
+    n = len(prices)
+    if n < period + 1:
+        return [None] * n
+
+    results: List[Optional[float]] = [None] * n
+
+    # Calculate price changes
+    gains = []
+    losses = []
+    for i in range(1, n):
+        delta = prices[i] - prices[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+
+    # Initial average gain / loss (SMA over first `period` changes)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    if avg_loss == 0:
+        results[period] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        results[period] = 100.0 - 100.0 / (1.0 + rs)
+
+    # Smoothed RSI for remaining values
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+        if avg_loss == 0:
+            results[i + 1] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            results[i + 1] = 100.0 - 100.0 / (1.0 + rs)
+
+    return results
 
 
 def atr(highs: List[float], lows: List[float], closes: List[float], period: int) -> List[float]:

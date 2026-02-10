@@ -1,21 +1,41 @@
-* {
-  box-sizing: border-box;
-  padding: 0;
-  margin: 0;
+@import "tailwindcss";
+
+/* Tell Tailwind v4 where to scan for class usage */
+@source "../components/**/*.tsx";
+@source "../lib/**/*.ts";
+
+/* Custom theme — replaces tailwind.config.ts for Tailwind v4 */
+@theme {
+  /* Neutral dark palette (Coinbase-inspired) */
+  --color-surface: #1a1a1a;
+  --color-surface-raised: #222222;
+  --color-surface-overlay: #2a2a2a;
+  --color-surface-border: #333333;
+
+  /* Semantic colors */
+  --color-profit: #22c55e;
+  --color-loss: #ef4444;
+  --color-hold: #6b7280;
+  --color-accent: #3b82f6;
+  --color-accent-hover: #2563eb;
+  --color-muted: #9ca3af;
+
+  /* Fonts */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "SF Mono", "Fira Code", monospace;
 }
 
-html,
-body {
-  max-width: 100vw;
-  overflow-x: hidden;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
+/* Base layer overrides */
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
 
-body {
-  background-color: #1a1a1a;
-  color: #ffffff;
+  html,
+  body {
+    max-width: 100vw;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
 }
