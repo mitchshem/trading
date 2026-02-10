@@ -13,19 +13,22 @@ class OrderType(Enum):
     """Order types."""
     BUY = "BUY"
     EXIT = "EXIT"
+    PARTIAL_EXIT = "PARTIAL_EXIT"
 
 
 class PendingOrder:
     """Represents a pending order that will execute on the next candle open."""
-    def __init__(self, order_type: OrderType, symbol: str, signal_price: float, timestamp: int, 
-                 stop_distance: Optional[float] = None, reason: Optional[str] = None):
+    def __init__(self, order_type: OrderType, symbol: str, signal_price: float, timestamp: int,
+                 stop_distance: Optional[float] = None, reason: Optional[str] = None,
+                 exit_pct: Optional[float] = None):
         self.order_type = order_type
         self.symbol = symbol
         self.signal_price = signal_price  # Price from signal (for reference)
         self.timestamp = timestamp  # Timestamp when order was created
         self.stop_distance = stop_distance  # For BUY orders only
         self.reason = reason  # For EXIT orders only
-    
+        self.exit_pct = exit_pct  # For PARTIAL_EXIT only (0.0-1.0)
+
     def to_dict(self):
         return {
             "order_type": self.order_type.value,
@@ -33,7 +36,8 @@ class PendingOrder:
             "signal_price": self.signal_price,
             "timestamp": self.timestamp,
             "stop_distance": self.stop_distance,
-            "reason": self.reason
+            "reason": self.reason,
+            "exit_pct": self.exit_pct
         }
 
 
@@ -108,17 +112,54 @@ class PaperBroker:
         
         # Track realized P&L for the day
         self.daily_realized_pnl = 0.0
-        
+
         # Pending orders queue - orders execute on next candle open
         self.pending_orders: List[PendingOrder] = []
+
+        # ── Phase 3: Enhanced Risk Management State ──
+
+        # High-water mark for drawdown tracking
+        self.high_water_mark: float = initial_equity
+
+        # Weekly / monthly loss tracking
+        self.weekly_pnl: float = 0.0
+        self.monthly_pnl: float = 0.0
+        self.last_reset_week: Optional[int] = None   # ISO week number
+        self.last_reset_month: Optional[int] = None   # Month number
+
+        # Consecutive losing days tracking
+        self.consecutive_losing_days: int = 0
+        self.last_daily_pnl_date: Optional[date] = None
+        self.pause_until_date: Optional[date] = None  # Pause trading until this date
+
+        # Risk control limits (configurable)
+        self.max_daily_loss_pct: float = 0.02       # 2% daily loss limit
+        self.max_weekly_loss_pct: float = 0.05      # 5% weekly loss limit
+        self.max_monthly_loss_pct: float = 0.10     # 10% monthly loss limit
+        self.max_consecutive_losing_days: int = 5   # 5 losing days → pause 1 day
+        self.max_drawdown_from_hwm_pct: float = 0.15  # 15% drawdown from HWM
+
+        # Portfolio-level controls
+        self.max_portfolio_exposure_pct: float = 0.80  # 80% of equity max exposure
+        self.vol_adjustment_enabled: bool = True        # Volatility-adjusted sizing
+
+        # Session boundary controls
+        self.session_close_enforced: bool = False  # Whether EOD close was enforced
+        self.no_entry_minutes_before_close: int = 15  # No new entries in last 15 min
     
-    def reset_daily_stats_if_needed(self):
-        """Reset daily stats if it's a new day."""
-        today = date.today()
-        if today != self.last_reset_date:
+    def reset_daily_stats_if_needed(self, current_date: date = None):
+        """Reset daily stats if it's a new day.
+
+        Args:
+            current_date: The date to check against. Defaults to date.today()
+                for backward compatibility. Pass an explicit date for replay
+                or live trading that spans multiple days.
+        """
+        check_date = current_date if current_date is not None else date.today()
+        if check_date != self.last_reset_date:
             self.daily_pnl = 0.0
             self.daily_realized_pnl = 0.0
-            self.last_reset_date = today
+            self.last_reset_date = check_date
             self.trade_blocked = False  # Reset kill switch for new day
     
     def calculate_position_size(self, entry_price: float, stop_distance: float, current_equity: float) -> int:
@@ -262,6 +303,118 @@ class PaperBroker:
             "reason": reason
         }
     
+    def _execute_partial_exit_internal(self, symbol: str, fill_price: float, exit_pct: float,
+                                       timestamp: int, reason: str) -> Optional[Dict]:
+        """
+        Internal method to execute a partial EXIT order immediately.
+        Sells a percentage of the position and keeps the remainder.
+
+        Args:
+            symbol: Trading symbol
+            fill_price: Fill price (next candle open with slippage)
+            exit_pct: Fraction of position to exit (0.0-1.0)
+            timestamp: Execution timestamp
+            reason: Exit reason
+
+        Returns:
+            Dict with trade info if executed, None if no position
+        """
+        if symbol not in self.positions:
+            return None
+
+        position = self.positions[symbol]
+        exit_shares = max(1, math.floor(position.shares * exit_pct))
+
+        # Clamp: if exit_shares >= total shares, do a full exit instead
+        if exit_shares >= position.shares:
+            return self._execute_exit_internal(symbol, fill_price, timestamp, reason)
+
+        # Calculate exit commission on the partial lot
+        exit_commission = self.calculate_commission(exit_shares)
+
+        # Pro-rate the entry commission: fraction attributable to exited shares
+        entry_commission_portion = position.entry_commission * (exit_shares / position.shares)
+
+        total_commission = entry_commission_portion + exit_commission
+
+        # P&L for the exited shares
+        gross_pnl = (fill_price - position.entry_price) * exit_shares
+        net_pnl = gross_pnl - total_commission
+
+        # Cash: add proceeds minus exit commission
+        proceeds = exit_shares * fill_price
+        net_proceeds = proceeds - exit_commission
+        self.cash += net_proceeds
+
+        assert self.cash >= 0, (
+            f"Cash became negative: {self.cash} after PARTIAL_EXIT of {exit_shares} shares @ {fill_price}"
+        )
+
+        # Update daily realized P&L
+        self.daily_realized_pnl += net_pnl
+
+        # Reduce position in-place
+        remaining_shares = position.shares - exit_shares
+        remaining_entry_commission = position.entry_commission - entry_commission_portion
+        position.shares = remaining_shares
+        position.entry_commission = remaining_entry_commission
+
+        return {
+            "action": "PARTIAL_EXIT",
+            "symbol": symbol,
+            "shares": exit_shares,
+            "remaining_shares": remaining_shares,
+            "entry_price": position.entry_price,
+            "exit_price": fill_price,
+            "pnl": net_pnl,
+            "net_pnl": net_pnl,
+            "entry_commission": entry_commission_portion,
+            "exit_commission": exit_commission,
+            "total_commission": total_commission,
+            "timestamp": timestamp,
+            "reason": reason
+        }
+
+    def execute_partial_exit(self, symbol: str, signal_price: float, exit_pct: float,
+                             timestamp: int, reason: str) -> Optional[Dict]:
+        """
+        Create a pending PARTIAL_EXIT order that will execute on the next candle open.
+
+        Args:
+            symbol: Trading symbol
+            signal_price: Price from signal (for reference)
+            exit_pct: Fraction of position to exit (0.0-1.0)
+            timestamp: Current timestamp
+            reason: Exit reason
+
+        Returns:
+            Dict with pending order info if created, None if no position
+        """
+        self.reset_daily_stats_if_needed()
+
+        if symbol not in self.positions:
+            return None
+
+        pending_order = PendingOrder(
+            order_type=OrderType.PARTIAL_EXIT,
+            symbol=symbol,
+            signal_price=signal_price,
+            timestamp=timestamp,
+            reason=reason,
+            exit_pct=exit_pct
+        )
+
+        self.pending_orders.append(pending_order)
+
+        return {
+            "action": "PARTIAL_EXIT_PENDING",
+            "symbol": symbol,
+            "signal_price": signal_price,
+            "exit_pct": exit_pct,
+            "timestamp": timestamp,
+            "reason": reason
+        }
+
     def process_pending_orders(self, current_open_price: float, timestamp: int) -> List[Dict]:
         """
         Process all pending orders at the current candle open price.
@@ -317,10 +470,10 @@ class PaperBroker:
                 # Check if position still exists (may have been closed by another order)
                 if order.symbol not in self.positions:
                     continue
-                
+
                 # Apply slippage to open price
                 fill_price = self.apply_slippage(current_open_price, is_buy=False)
-                
+
                 # Execute EXIT
                 trade = self._execute_exit_internal(
                     symbol=order.symbol,
@@ -328,10 +481,30 @@ class PaperBroker:
                     timestamp=timestamp,
                     reason=order.reason or "EXIT"
                 )
-                
+
                 if trade:
                     executed_trades.append(trade)
-        
+
+            elif order.order_type == OrderType.PARTIAL_EXIT:
+                # Check if position still exists
+                if order.symbol not in self.positions:
+                    continue
+
+                # Apply slippage to open price
+                fill_price = self.apply_slippage(current_open_price, is_buy=False)
+
+                # Execute PARTIAL_EXIT
+                trade = self._execute_partial_exit_internal(
+                    symbol=order.symbol,
+                    fill_price=fill_price,
+                    exit_pct=order.exit_pct,
+                    timestamp=timestamp,
+                    reason=order.reason or "PARTIAL_EXIT"
+                )
+
+                if trade:
+                    executed_trades.append(trade)
+
         return executed_trades
     
     def calculate_commission(self, shares: int) -> float:
@@ -617,6 +790,322 @@ class PaperBroker:
         
         return []
     
+    # ══════════════════════════════════════════════════════════════
+    # Phase 3: Enhanced Risk Management
+    # ══════════════════════════════════════════════════════════════
+
+    def reset_weekly_stats_if_needed(self, current_date: date):
+        """Reset weekly stats if it's a new ISO week."""
+        iso_week = current_date.isocalendar()[1]
+        if self.last_reset_week is None or iso_week != self.last_reset_week:
+            self.weekly_pnl = 0.0
+            self.last_reset_week = iso_week
+
+    def reset_monthly_stats_if_needed(self, current_date: date):
+        """Reset monthly stats if it's a new month."""
+        if self.last_reset_month is None or current_date.month != self.last_reset_month:
+            self.monthly_pnl = 0.0
+            self.last_reset_month = current_date.month
+
+    def update_high_water_mark(self):
+        """Update the high-water mark if equity exceeds it."""
+        if self.equity > self.high_water_mark:
+            self.high_water_mark = self.equity
+
+    def track_daily_pnl_for_streak(self, current_date: date):
+        """
+        Track consecutive losing days. Called once per day after market close.
+        A losing day is defined as daily_pnl < 0.
+        """
+        if self.last_daily_pnl_date == current_date:
+            return  # Already tracked today
+
+        if self.daily_pnl < 0:
+            self.consecutive_losing_days += 1
+        else:
+            self.consecutive_losing_days = 0
+
+        self.last_daily_pnl_date = current_date
+
+    def check_weekly_loss_limit(self) -> bool:
+        """Check if weekly loss limit is breached."""
+        max_weekly_loss = self.high_water_mark * self.max_weekly_loss_pct
+        return self.weekly_pnl <= -max_weekly_loss
+
+    def check_monthly_loss_limit(self) -> bool:
+        """Check if monthly loss limit is breached."""
+        max_monthly_loss = self.high_water_mark * self.max_monthly_loss_pct
+        return self.monthly_pnl <= -max_monthly_loss
+
+    def check_drawdown_from_hwm(self) -> bool:
+        """Check if drawdown from high-water mark exceeds limit."""
+        if self.high_water_mark <= 0:
+            return False
+        drawdown_pct = (self.high_water_mark - self.equity) / self.high_water_mark
+        return drawdown_pct >= self.max_drawdown_from_hwm_pct
+
+    def check_consecutive_losing_days(self) -> bool:
+        """Check if consecutive losing days limit is reached."""
+        return self.consecutive_losing_days >= self.max_consecutive_losing_days
+
+    def is_paused(self, current_date: date) -> bool:
+        """Check if trading is paused due to consecutive losing days."""
+        if self.pause_until_date and current_date < self.pause_until_date:
+            return True
+        if self.pause_until_date and current_date >= self.pause_until_date:
+            self.pause_until_date = None  # Pause expired
+            self.consecutive_losing_days = 0  # Reset counter
+        return False
+
+    def check_all_risk_controls(self, current_prices: Dict[str, float], timestamp: int, current_date: Optional[date] = None) -> Dict:
+        """
+        Comprehensive risk control check. Returns a dict describing which limits are breached.
+
+        Args:
+            current_prices: Current prices for all symbols
+            timestamp: Current timestamp
+            current_date: Date for weekly/monthly tracking (defaults to date.today())
+
+        Returns:
+            Dict with risk status:
+            {
+                "any_breached": bool,
+                "daily_breached": bool,
+                "weekly_breached": bool,
+                "monthly_breached": bool,
+                "hwm_drawdown_breached": bool,
+                "consecutive_days_breached": bool,
+                "is_paused": bool,
+                "details": {...}
+            }
+        """
+        if current_date is None:
+            current_date = date.today()
+
+        self.update_equity(current_prices)
+        self.update_high_water_mark()
+        self.reset_weekly_stats_if_needed(current_date)
+        self.reset_monthly_stats_if_needed(current_date)
+
+        daily = self.check_daily_loss_limit()
+        weekly = self.check_weekly_loss_limit()
+        monthly = self.check_monthly_loss_limit()
+        hwm = self.check_drawdown_from_hwm()
+        consec = self.check_consecutive_losing_days()
+        paused = self.is_paused(current_date)
+
+        any_breached = daily or weekly or monthly or hwm or consec or paused
+
+        drawdown_pct = (
+            (self.high_water_mark - self.equity) / self.high_water_mark * 100
+            if self.high_water_mark > 0 else 0
+        )
+
+        return {
+            "any_breached": any_breached,
+            "daily_breached": daily,
+            "weekly_breached": weekly,
+            "monthly_breached": monthly,
+            "hwm_drawdown_breached": hwm,
+            "consecutive_days_breached": consec,
+            "is_paused": paused,
+            "details": {
+                "daily_pnl": round(self.daily_pnl, 2),
+                "weekly_pnl": round(self.weekly_pnl, 2),
+                "monthly_pnl": round(self.monthly_pnl, 2),
+                "high_water_mark": round(self.high_water_mark, 2),
+                "drawdown_from_hwm_pct": round(drawdown_pct, 2),
+                "consecutive_losing_days": self.consecutive_losing_days,
+                "pause_until_date": str(self.pause_until_date) if self.pause_until_date else None,
+            },
+        }
+
+    def enforce_enhanced_risk_controls(self, current_prices: Dict[str, float], timestamp: int, current_date: Optional[date] = None) -> List[Dict]:
+        """
+        Check ALL risk controls and enforce them.
+        Extends check_and_enforce_risk_controls with weekly, monthly, HWM, and streak limits.
+
+        Args:
+            current_prices: Dict of symbol -> current price
+            timestamp: Current timestamp
+            current_date: Date for period tracking
+
+        Returns:
+            List of pending exit order dicts if any limit triggered
+        """
+        if current_date is None:
+            current_date = date.today()
+
+        status = self.check_all_risk_controls(current_prices, timestamp, current_date)
+
+        if status["any_breached"] and not self.trade_blocked:
+            # Determine reason
+            reasons = []
+            if status["daily_breached"]:
+                reasons.append("daily_loss_limit")
+            if status["weekly_breached"]:
+                reasons.append("weekly_loss_limit")
+            if status["monthly_breached"]:
+                reasons.append("monthly_loss_limit")
+            if status["hwm_drawdown_breached"]:
+                reasons.append("hwm_drawdown_limit")
+            if status["consecutive_days_breached"]:
+                reasons.append("consecutive_losing_days")
+                # Set pause for next trading day
+                from datetime import timedelta
+                self.pause_until_date = current_date + timedelta(days=1)
+            if status["is_paused"]:
+                reasons.append("trading_paused")
+
+            reason_str = "KILL_SWITCH: " + ", ".join(reasons)
+            self.trigger_kill_switch()
+            pending_exits = self.close_all_positions(current_prices, timestamp)
+
+            # Update weekly/monthly pnl
+            self.weekly_pnl += self.daily_pnl
+            self.monthly_pnl += self.daily_pnl
+
+            return pending_exits
+
+        return []
+
+    def end_of_day(self, current_prices: Dict[str, float], timestamp: int, current_date: Optional[date] = None):
+        """
+        End-of-day processing:
+        1. Close all open positions (session boundary enforcement)
+        2. Track consecutive losing days
+        3. Update weekly/monthly P&L
+        4. Update high-water mark
+
+        Args:
+            current_prices: Current prices for position closing
+            timestamp: Current timestamp
+            current_date: Date for tracking
+
+        Returns:
+            Dict with EOD summary
+        """
+        if current_date is None:
+            current_date = date.today()
+
+        self.update_equity(current_prices)
+
+        # Close all positions (session boundary enforcement)
+        pending_exits = []
+        if self.positions:
+            pending_exits = self.close_all_positions(current_prices, timestamp)
+            self.session_close_enforced = True
+
+        # Track daily P&L for streak
+        self.track_daily_pnl_for_streak(current_date)
+
+        # Update weekly/monthly P&L
+        self.reset_weekly_stats_if_needed(current_date)
+        self.reset_monthly_stats_if_needed(current_date)
+        self.weekly_pnl += self.daily_pnl
+        self.monthly_pnl += self.daily_pnl
+
+        # Update HWM
+        self.update_high_water_mark()
+
+        return {
+            "date": str(current_date),
+            "daily_pnl": round(self.daily_pnl, 2),
+            "weekly_pnl": round(self.weekly_pnl, 2),
+            "monthly_pnl": round(self.monthly_pnl, 2),
+            "equity": round(self.equity, 2),
+            "high_water_mark": round(self.high_water_mark, 2),
+            "consecutive_losing_days": self.consecutive_losing_days,
+            "positions_closed": len(pending_exits),
+            "pending_exits": pending_exits,
+        }
+
+    def check_portfolio_exposure(self, current_prices: Dict[str, float]) -> float:
+        """
+        Calculate current portfolio exposure as fraction of equity.
+
+        Returns:
+            Exposure as decimal (e.g., 0.65 = 65% of equity in positions)
+        """
+        if self.equity <= 0:
+            return 1.0
+
+        total_position_value = 0.0
+        for symbol, position in self.positions.items():
+            price = current_prices.get(symbol, position.entry_price)
+            total_position_value += position.shares * price
+
+        return total_position_value / self.equity
+
+    def can_open_position(self, current_prices: Dict[str, float], proposed_value: float, current_date: Optional[date] = None) -> Dict:
+        """
+        Check if a new position can be opened given portfolio-level constraints.
+
+        Args:
+            current_prices: Current prices for all symbols
+            proposed_value: Dollar value of proposed new position
+            current_date: Date for pause check
+
+        Returns:
+            Dict with {"allowed": bool, "reason": str}
+        """
+        if current_date is None:
+            current_date = date.today()
+
+        if self.trade_blocked:
+            return {"allowed": False, "reason": "Trading blocked by kill-switch"}
+
+        if self.is_paused(current_date):
+            return {"allowed": False, "reason": f"Trading paused until {self.pause_until_date}"}
+
+        current_exposure = self.check_portfolio_exposure(current_prices)
+        proposed_exposure = (current_exposure * self.equity + proposed_value) / self.equity
+
+        if proposed_exposure > self.max_portfolio_exposure_pct:
+            return {
+                "allowed": False,
+                "reason": f"Would exceed max exposure ({proposed_exposure:.1%} > {self.max_portfolio_exposure_pct:.0%})",
+            }
+
+        return {"allowed": True, "reason": "Within all limits"}
+
+    def calculate_vol_adjusted_position_size(
+        self, entry_price: float, stop_distance: float,
+        current_equity: float, current_atr: Optional[float] = None,
+        historical_atr: Optional[float] = None,
+    ) -> int:
+        """
+        Volatility-adjusted position sizing.
+
+        When current ATR is higher than historical average ATR, reduce position size.
+        When lower, increase (up to base size). This prevents oversized positions in
+        high-volatility environments.
+
+        Args:
+            entry_price: Entry price
+            stop_distance: Stop distance in price units
+            current_equity: Current equity
+            current_atr: Current ATR(14)
+            historical_atr: Historical average ATR (e.g., 50-day avg)
+
+        Returns:
+            Number of shares
+        """
+        base_shares = self.calculate_position_size(entry_price, stop_distance, current_equity)
+
+        if not self.vol_adjustment_enabled or current_atr is None or historical_atr is None:
+            return base_shares
+
+        if historical_atr <= 0:
+            return base_shares
+
+        # Vol ratio: if current vol = 2× historical, scale = 0.5
+        vol_ratio = current_atr / historical_atr
+        scale_factor = min(1.0, 1.0 / vol_ratio)  # Never increase beyond base
+
+        adjusted = math.floor(base_shares * scale_factor)
+        return max(0, adjusted)
+
     def get_account_summary(self, current_prices: Dict[str, float]) -> Dict:
         """
         Get account summary.
